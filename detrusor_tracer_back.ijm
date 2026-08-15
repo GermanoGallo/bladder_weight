@@ -22,72 +22,62 @@
 //
 //  Saida: poligono na imagem + metricas na barra de status e na janela Log.
 //
-//  CRITERIOS DE ANALISE (v3, 15/08/2026)
-//  Base: 10 medidas corrigidas com ROI auto/final + 20 imagens anotadas
-//  manualmente (PACIENTE_17 a 21), onde o detrusor variou de 0.21 a 2.89 mm.
+//  CRITERIOS DE ANALISE (recalibrados em 15/08/2026 com 10 medidas
+//  corrigidas manualmente e 9 pares de ROI auto/final)
 //    - Dperp e a medida primaria de espessura. Fmin superestima em 1.50x
 //      +- 0.10 e passou a ser indicador de forma, nao de espessura.
-//    - Janela de busca ADAPTATIVA, medida na coluna do clique, com teto de
-//      2.50 mm. Uma janela fixa nao serve: as imagens anotadas mostram o
-//      musculo variando mais de dez vezes em espessura entre pacientes.
-//    - O alvo e o vale hipoecoico entre as duas faixas hiperecoicas. Uma
-//      linha central curva e tracada primeiro; as bordas sao buscadas numa
-//      faixa estreita que acompanha essa curva.
+//    - Janela de busca reduzida de 1.20 para 0.70 mm: a distancia do
+//      clique ate a borda corrigida nunca passou de 0.503 mm.
 //    - Alerta de saturacao (borda encostada no limite da janela): detectou
 //      o unico erro grosseiro da serie sem nenhum falso positivo.
-//    - RAF saiu dos criterios: depende da espessura e nao serve para
-//      musculo fino e grosso ao mesmo tempo. No lugar dele, Fmin/Dperp,
-//      que e adimensional e denuncia poligono obliquo.
-//    - Espessura fora de 0.15 a 4.00 mm sinaliza revisao.
+//    - RAF passou de 3.0 para 6.0: com 3.0 o alerta nunca disparava.
+//    - Espessura fora de 0.25 a 0.95 mm sinaliza revisao.
 //    - lambda e blur mantidos: as bordas automaticas ja saem mais suaves
 //      que as corrigidas a mao.
-//    - Nada obriga o musculo a ser reto: a linha central e livre para
-//      subir e descer coluna a coluna, limitada apenas pela suavidade.
+//    - A linha-base da busca acompanha a inclinacao local (estimada em uma
+//      passada piloto no trecho central). Com linha-base horizontal, um
+//      detrusor obliquo escapa da janela e o poligono corta a parede em
+//      diagonal, inflando o Dperp.
 // =====================================================================
 
 // ------------------------------------------------------------- parametros
+//  Valores recalibrados a partir de 10 medidas corrigidas manualmente
+//  (IM_0002/0003/0006/0007, sagital, pre-miccional, 30 MHz, ~0.025 mm/px).
+//  Ver o bloco CRITERIOS DE ANALISE no fim deste cabeçalho de secao.
 
-// Comprimento do trecho medido (meia-largura). 3 mm de cada lado sobra para
-// uma medida de espessura; janela longa demais so aumenta a chance de o
-// musculo sair do campo util.
-var halfWidthMm         = 3.0;
-var halfWidthPx         = 120;    // idem, imagem SEM calibracao
-
-// TETO da busca, nao a espessura esperada. A janela real e adaptativa: sai
-// da propria imagem, na coluna do clique. Isso e o que permite o mesmo
-// script medir 0.2 mm num paciente e 3 mm em outro - nas 20 imagens
-// anotadas o detrusor variou de 0.21 a 2.89 mm.
-var espMaxBuscaMm       = 2.50;
-var espMaxBuscaPx       = 100;
-var folgaBusca          = 1.80;   // janela = folga x distancia medida na semente
+var halfWidthMm         = 4.0;    // meia-largura da janela, imagem calibrada
+// 1.20 antes. Nas 10 medidas corrigidas a distancia do clique ate a borda
+// nunca passou de 0.503 mm (p90 = 0.497). Com 1.20 a janela permitia uma
+// "espessura" de ate 2.4 mm, tres vezes o maximo real, e foi exatamente o
+// que produziu o unico erro grosseiro da serie (caso 6: 1.545 mm no
+// automatico contra 0.514 mm apos correcao). 0.70 mantem ~40% de folga.
+var maxHalfThicknessMm  = 0.70;   // espessura maxima buscada, calibrada
+var halfWidthPx         = 160;    // meia-largura, imagem SEM calibracao
+var maxHalfThicknessPx  = 28;     // espessura maxima, imagem SEM calibracao
 var minHalfThicknessPx  = 2;
-
-var lambda              = 0.60;   // suavidade das bordas
+// Mantidos: as bordas automaticas ja saem MAIS suaves que as corrigidas a
+// mao (rugosidade media 0.044 mm contra 0.083 mm). Aumentar lambda so
+// brigaria com o operador; o problema nunca foi falta de suavidade.
+var lambda              = 0.60;   // suavidade do caminho
 var blurSigma           = 1.00;   // blur anti-speckle, em pixels
 var nodesPerBorder      = 12;     // nos por borda
-
-// --- linha central do vale hipoecoico ---
-// A busca das bordas acompanha esta curva. lambdaCentro alto deixa a linha
-// mais rigida; passoColuna/passoLinha decimam a grade da programacao
-// dinamica (a curva do musculo e suave, nao precisa de resolucao de pixel).
-var lambdaCentro        = 0.35;
-var passoColuna         = 4;
-var passoLinha          = 2;
-var derivaMax           = 0.50;   // deriva vertical maxima, fracao da meia-largura
-var ancoraPeso          = 0.004;  // puxa o clique para o vale escuro mais proximo
-
-// --- criterios de qualidade ---
-// Faixa plausivel da espessura do detrusor, ampla o bastante para cobrir a
-// variacao entre pacientes observada nas imagens anotadas.
-var espMinMm            = 0.15;
-var espMaxMm            = 4.00;
-// Fmin/Dperp fica em torno de 1.5 num poligono bem posto. Muito acima
-// disso, o poligono esta obliquo ou atravessando a parede. Criterio
-// adimensional: vale igual para musculo fino e grosso, ao contrario do RAF.
-var razaoMax            = 2.20;
-var rafThreshold        = 0;      // 0 = nao usa RAF como criterio
-// Fracao das colunas que pode encostar no limite da janela de busca.
+// 3.0 antes, e nunca disparou: o menor RAF automatico da serie foi 4.20,
+// justamente o caso que falhou. O segundo menor foi 7.13, numa medida boa.
+var rafThreshold        = 6.0;    // limiar de RAF para sinalizar revisao
+// Faixa plausivel da espessura do detrusor nesta serie (Dperp corrigido
+// variou de 0.313 a 0.797 mm). Fora disso, revisar.
+var espMinMm            = 0.25;
+var espMaxMm            = 0.95;
+// Fracao das colunas que pode encostar no limite da janela antes de o
+// tracado ser considerado saturado (indicador causal de fuga da borda).
 var satTolerancia       = 0.05;
+// A linha-base da busca acompanha a inclinacao local do detrusor. Sem isso,
+// numa faixa obliqua a janela de +-0.70 mm e vencida pela deriva: a 20 graus
+// o detrusor desce ~1.5 mm ao longo dos 4 mm de janela.
+var seguirInclinacao    = true;
+var inclinacaoMax       = 0.70;   // dy/dx maximo aceito (~35 graus)
+var inclinacaoMin       = 0.05;   // abaixo disso trata como horizontal
+var fracaoPiloto        = 0.35;   // trecho central usado para medir a inclinacao
 
 // ------------------------------------------------------------ estado interno
 var calX = 1.0;
@@ -102,10 +92,6 @@ var satInf = 0;
 // gradiente da faixa extraida.
 var inclinacaoAtual = 0;
 var gradMaxAbs = 1;
-var espSemente = 0;
-// Faixa extraida da imagem: intensidade normalizada e gradiente vertical.
-var IMG = newArray(0);
-var GRAD = newArray(0);
 
 
 // ================================================================== inicio
@@ -251,14 +237,10 @@ function relatorio(xc, yc, dt, imprime) {
     //  medidas corrigidas a razao Fmin/Dperp ficou em 1.50 +- 0.10
     //  (faixa 1.30 a 1.66), porque a faixa e alongada e levemente curva.
     //  Fmin fica como indicador secundario de forma, nao de espessura.
-    razao = NaN;
-    if (dperp > 0) razao = fmin / dperp;
     alerta = "";
     if (satSup > satTolerancia || satInf > satTolerancia)
         alerta = alerta + "  << BORDA NO LIMITE DA JANELA";
-    if (!isNaN(razao) && razao > razaoMax)
-        alerta = alerta + "  << POLIGONO OBLIQUO";
-    if (rafThreshold > 0 && raf < rafThreshold)
+    if (raf < rafThreshold)
         alerta = alerta + "  << RAF BAIXO";
     if (!uncalibrated && !isNaN(dperp) && (dperp < espMinMm || dperp > espMaxMm))
         alerta = alerta + "  << ESPESSURA ATIPICA";
@@ -293,11 +275,8 @@ function relatorio(xc, yc, dt, imprime) {
         print("  RAF (Fmax/Fmin) : " + d2s(raf, 2));
         print("  saturacao       : sup " + d2s(satSup * 100, 0)
               + "%  inf " + d2s(satInf * 100, 0) + "% das colunas");
-        print("  inclinacao media: " + d2s(inclinacaoAtual, 3) + " dy/dx  ("
+        print("  inclinacao      : " + d2s(inclinacaoAtual, 3) + " dy/dx  ("
               + d2s(atan(inclinacaoAtual) * 180 / PI, 1) + " graus)");
-        print("  semente (clique): " + d2s(espSemente, 3) + " " + u
-              + "  -> janela adaptativa");
-        print("  Fmin/Dperp      : " + d2s(razao, 2) + "   [esperado ~1.5]");
         if (lengthOf(alerta) > 0) print("  QC              : REVISAR ->" + alerta);
         else                      print("  QC              : ok");
         print("  vertices        : " + n + " (" + lastUpperCount + " por borda)");
@@ -307,118 +286,96 @@ function relatorio(xc, yc, dt, imprime) {
 
 
 // =================================================================== tracado
-//  MODELO: o detrusor e uma faixa HIPOECOICA delimitada por duas faixas
-//  HIPERECOICAS espessas. Em vez de procurar duas bordas soltas em torno de
-//  uma reta, o traçado agora tem tres etapas:
+//  A busca segue uma linha-base INCLINADA, nao a horizontal. Sem isso, num
+//  detrusor obliquo a faixa sai da janela ao longo dos 4 mm e o poligono
+//  atravessa a parede em vez de acompanha-la (Dperp inflado, RAF baixo).
 //
-//    1. Ancoragem: o clique e puxado para o vale escuro local.
-//    2. Espessura de partida: na coluna do clique, mede a distancia ate o
-//       gradiente mais forte acima e abaixo. Dai sai uma janela de busca
-//       ADAPTATIVA - essencial, porque o musculo vai de ~0.2 a ~3 mm entre
-//       pacientes e uma janela fixa ou estrangula um caso ou solta o outro.
-//    3. Linha central CURVA: programacao dinamica sobre a escuridao,
-//       ancorada na coluna do clique, livre para subir e descer coluna a
-//       coluna. So depois as duas bordas sao buscadas numa faixa estreita
-//       que acompanha essa curva. O musculo pode ondular a vontade; nada
-//       aqui o obriga a ser reto.
+//  Duas passadas:
+//    1. janela horizontal estreita, linha-base horizontal, so para estimar
+//       a inclinacao local pela linha media entre as duas bordas;
+//    2. janela completa, linha-base inclinada por essa estimativa.
+//  O gradiente e extraido uma unica vez, numa faixa alta o bastante para
+//  comportar a deriva maxima admitida.
 
 function trace(xc, yc) {
     w = getWidth();
     h = getHeight();
 
     if (uncalibrated) {
-        halfW    = round(halfWidthPx);
-        tetoMeia = round(espMaxBuscaPx);
+        halfW   = round(halfWidthPx);
+        maxHalf = round(maxHalfThicknessPx);
     } else {
-        halfW    = round(halfWidthMm / calX);
-        tetoMeia = round(espMaxBuscaMm / calY);
+        halfW   = round(halfWidthMm / calX);
+        maxHalf = round(maxHalfThicknessMm / calY);
     }
     if (halfW < 5) halfW = 5;
-    if (tetoMeia < minHalfThicknessPx + 3) tetoMeia = minHalfThicknessPx + 3;
+    if (maxHalf < minHalfThicknessPx + 2) maxHalf = minHalfThicknessPx + 2;
 
     x0 = maxOf(1, xc - halfW);
     x1 = minOf(w - 2, xc + halfW);
     if (x1 - x0 < 8) return false;
     nx = x1 - x0 + 1;
-    ic = xc - x0;
 
-    deriva  = round(derivaMax * halfW);
-    bandTop = maxOf(1,     yc - tetoMeia - deriva);
-    bandBot = minOf(h - 2, yc + tetoMeia + deriva);
+    // Faixa vertical a extrair: espessura buscada + deriva maxima da
+    // linha-base inclinada nas extremidades da janela.
+    deriva  = round(inclinacaoMax * maxOf(xc - x0, x1 - xc));
+    bandTop = maxOf(1,     yc - maxHalf - deriva);
+    bandBot = minOf(h - 2, yc + maxHalf + deriva);
     nb = bandBot - bandTop + 1;
-    if (nb < 8) return false;
+    if (nb < 2 * minHalfThicknessPx + 4) return false;
 
-    if (!extraiBanda(x0, nx, bandTop, nb)) return false;
-
-    // ---- 1. ancora o clique no vale escuro ------------------------------
-    jc = yc - bandTop;
-    busca = round(tetoMeia / 2);
-    melhor = 1e30;
-    jMelhor = jc;
-    for (d = -busca; d <= busca; d++) {
-        j = jc + d;
-        if (j >= 1 && j < nb - 1) {
-            v = IMG[j * nx + ic] + ancoraPeso * abs(d);
-            if (v < melhor) { melhor = v; jMelhor = j; }
-        }
-    }
-    jc = jMelhor;
-
-    // ---- 2. espessura de partida na coluna do clique --------------------
-    dSup = 0; gSup = 0;
-    dInf = 0; gInf = 0;
-    for (d = minHalfThicknessPx; d <= tetoMeia; d++) {
-        j = jc - d;
-        if (j >= 1) {
-            v = -GRAD[j * nx + ic];      // claro -> escuro descendo
-            if (v > gSup) { gSup = v; dSup = d; }
-        }
-        j = jc + d;
-        if (j < nb - 1) {
-            v = GRAD[j * nx + ic];       // escuro -> claro descendo
-            if (v > gInf) { gInf = v; dInf = d; }
-        }
-    }
-    if (dSup == 0 || dInf == 0) return false;
-
-    // Janela adaptativa: folga sobre a maior das duas distancias medidas.
-    maxHalf = round(folgaBusca * maxOf(dSup, dInf)) + 2;
-    if (maxHalf > tetoMeia) maxHalf = tetoMeia;
-    if (maxHalf < minHalfThicknessPx + 2) maxHalf = minHalfThicknessPx + 2;
-    espSemente = (dSup + dInf) * calY;
-
-    // ---- 3. linha central curva ----------------------------------------
-    centro = linhaCentral(nx, nb, ic, jc, maxHalf, deriva);
+    grad = gradienteVertical(x0, nx, bandTop, nb, h);
+    if (lengthOf(grad) == 0) return false;
+    maxAbs = gradMaxAbs;
 
     ny = maxHalf - minHalfThicknessPx + 1;
     if (ny < 2) return false;
 
-    topsSup = faixaBorda(centro, nx, nb, -1, minHalfThicknessPx, maxHalf, ny);
-    topsInf = faixaBorda(centro, nx, nb,  1, minHalfThicknessPx, maxHalf, ny);
+    // ---- passada 1: inclinacao a partir de um trecho central curto ------
+    inclin = 0;
+    if (seguirInclinacao) {
+        meia = round(nx * fracaoPiloto / 2);
+        if (meia < 6) meia = 6;
+        ia = maxOf(0, round((xc - x0)) - meia);
+        ib = minOf(nx - 1, round((xc - x0)) + meia);
+        if (ib - ia >= 8) {
+            t1s = baseLinha(x0, nx, xc, yc, 0, -1, maxHalf, minHalfThicknessPx, bandTop, bandBot);
+            t1i = baseLinha(x0, nx, xc, yc, 0,  1, minHalfThicknessPx, maxHalf, bandTop, bandBot);
+            p1s = caminho(grad, nx, bandTop, t1s, ia, ib, ny, maxAbs, true);
+            p1i = caminho(grad, nx, bandTop, t1i, ia, ib, ny, maxAbs, false);
+            if (lengthOf(p1s) > 0 && lengthOf(p1i) > 0) {
+                nc = ib - ia + 1;
+                mid = newArray(nc);
+                for (i = 0; i < nc; i++) mid[i] = (p1s[i] + p1i[i]) / 2;
+                inclin = ajusteReta(mid);
+                if (inclin >  inclinacaoMax) inclin =  inclinacaoMax;
+                if (inclin < -inclinacaoMax) inclin = -inclinacaoMax;
+                if (abs(inclin) < inclinacaoMin) inclin = 0;
+            }
+        }
+    }
+    inclinacaoAtual = inclin;
 
-    upper = caminho(nx, topsSup, 0, nx - 1, ny, true);
-    lower = caminho(nx, topsInf, 0, nx - 1, ny, false);
+    // ---- passada 2: janela completa sobre a linha-base inclinada --------
+    topsSup = baseLinha(x0, nx, xc, yc, inclin, -1, maxHalf, minHalfThicknessPx, bandTop, bandBot);
+    topsInf = baseLinha(x0, nx, xc, yc, inclin,  1, minHalfThicknessPx, maxHalf, bandTop, bandBot);
+
+    upper = caminho(grad, nx, bandTop, topsSup, 0, nx - 1, ny, maxAbs, true);
+    lower = caminho(grad, nx, bandTop, topsInf, 0, nx - 1, ny, maxAbs, false);
     if (lengthOf(upper) == 0 || lengthOf(lower) == 0) return false;
 
     for (i = 0; i < nx; i++)
         if (lower[i] <= upper[i]) lower[i] = upper[i] + 1;
 
-    nSup = 0; nInf = 0;
+    // Saturacao medida contra os limites de CADA coluna, ja inclinados.
+    nSup = 0;
+    nInf = 0;
     for (i = 0; i < nx; i++) {
         if (upper[i] <= topsSup[i])          nSup++;
         if (lower[i] >= topsInf[i] + ny - 1) nInf++;
     }
     satSup = nSup / nx;
     satInf = nInf / nx;
-
-    // Curvatura efetiva da linha central, so para relatorio.
-    inclinacaoAtual = (centro[nx - 1] - centro[0]) / (nx - 1);
-
-    // Converte de indice de banda para y absoluto.
-    for (i = 0; i < nx; i++) {
-        upper[i] = upper[i] + bandTop;
-        lower[i] = lower[i] + bandTop;
-    }
 
     up = resamplePath(x0, upper, nodesPerBorder);
     lo = resamplePath(x0, lower, nodesPerBorder);
@@ -441,10 +398,44 @@ function trace(xc, yc) {
     return true;
 }
 
-/* Copia a faixa para IMG (intensidade suavizada) e GRAD (gradiente
-   vertical, f(y+1)-f(y-1)), ambos indexados por j*nx+i. Normaliza IMG
-   para 0..1. Uma unica passagem pela imagem: sem convolucao separada. */
-function extraiBanda(x0, nx, bandTop, nb) {
+/* Limite superior da faixa de busca em cada coluna, seguindo a linha-base
+   inclinada. lado = -1 para a borda de cima, +1 para a de baixo.
+   dIni/dFim sao as distancias, em pixels, da linha-base ate o inicio e o
+   fim da faixa daquele lado. Retorna o y absoluto da linha j = 0. */
+function baseLinha(x0, nx, xc, yc, inclin, lado, dIni, dFim, bandTop, bandBot) {
+    tops = newArray(nx);
+    ny = dFim - dIni + 1;
+    for (i = 0; i < nx; i++) {
+        c = yc + inclin * (x0 + i - xc);
+        if (lado < 0) t = round(c) - dFim;      // de -dFim ate -dIni
+        else          t = round(c) + dIni;      // de +dIni ate +dFim
+        if (t < bandTop) t = bandTop;
+        if (t + ny - 1 > bandBot) t = bandBot - ny + 1;
+        tops[i] = t;
+    }
+    return tops;
+}
+
+/* Inclinacao (dy/dx) por minimos quadrados sobre a linha media. */
+function ajusteReta(y) {
+    n = lengthOf(y);
+    if (n < 3) return 0;
+    sx = 0; sy = 0; sxx = 0; sxy = 0;
+    for (i = 0; i < n; i++) {
+        sx  = sx + i;
+        sy  = sy + y[i];
+        sxx = sxx + i * i;
+        sxy = sxy + i * y[i];
+    }
+    den = n * sxx - sx * sx;
+    if (abs(den) < 1e-9) return 0;
+    return (n * sxy - sx * sy) / den;
+}
+
+/* Extrai o gradiente vertical da faixa e guarda o maximo absoluto em
+   gradMaxAbs. Uma copia 32-bit, blur anti-speckle e convolucao
+   0 -1 0 / 0 0 0 / 0 1 0, que equivale a f(x,y+1) - f(x,y-1). */
+function gradienteVertical(x0, nx, bandTop, nb, h) {
     origID = getImageID();
     setBatchMode(true);
     run("Select None");
@@ -452,148 +443,31 @@ function extraiBanda(x0, nx, bandTop, nb) {
     tmpID = getImageID();
     run("32-bit");
     if (blurSigma > 0) run("Gaussian Blur...", "sigma=" + blurSigma);
+    run("Convolve...", "text1=[0 -1 0\n0 0 0\n0 1 0\n]");
 
-    IMG = newArray(nx * nb);
-    imin = 1e30; imax = -1e30;
+    makeRectangle(x0, 1, nx, h - 2);
+    getStatistics(aTmp, mTmp, gMin, gMax);
+    gradMaxAbs = maxOf(abs(gMin), abs(gMax));
+    if (gradMaxAbs < 0.000001) gradMaxAbs = 0.000001;
+
+    g = newArray(nx * nb);
     for (j = 0; j < nb; j++) {
         makeRectangle(x0, bandTop + j, nx, 1);
         p = getProfile();
         off = j * nx;
-        for (i = 0; i < nx; i++) {
-            v = p[i];
-            IMG[off + i] = v;
-            if (v < imin) imin = v;
-            if (v > imax) imax = v;
-        }
+        for (i = 0; i < nx; i++) g[off + i] = p[i];
     }
     run("Select None");
     selectImage(tmpID);
     close();
     selectImage(origID);
     setBatchMode(false);
-
-    rng = imax - imin;
-    if (rng < 0.000001) return false;
-    for (k = 0; k < nx * nb; k++) IMG[k] = (IMG[k] - imin) / rng;
-
-    GRAD = newArray(nx * nb);
-    gmax = 0.000001;
-    for (j = 1; j < nb - 1; j++) {
-        off = j * nx;
-        for (i = 0; i < nx; i++) {
-            g = IMG[off + nx + i] - IMG[off - nx + i];
-            GRAD[off + i] = g;
-            if (abs(g) > gmax) gmax = abs(g);
-        }
-    }
-    gradMaxAbs = gmax;
-    return true;
+    return g;
 }
 
-/* Linha central do vale hipoecoico: custo minimo sobre a escuridao,
-   ancorada na coluna do clique e livre para curvar. Resolvida numa grade
-   decimada (a curva do musculo e suave; nao precisa de resolucao de pixel)
-   e depois interpolada de volta. */
-function linhaCentral(nx, nb, ic, jc, maxHalf, deriva) {
-    jLo = maxOf(1, jc - deriva - maxHalf);
-    jHi = minOf(nb - 2, jc + deriva + maxHalf);
-    nj = floor((jHi - jLo) / passoLinha) + 1;
-    if (nj < 3) {
-        c = newArray(nx);
-        for (i = 0; i < nx; i++) c[i] = jc;
-        return c;
-    }
-    jcg = round((jc - jLo) / passoLinha);
-    if (jcg < 0) jcg = 0;
-    if (jcg > nj - 1) jcg = nj - 1;
-
-    centro = newArray(nx);
-    centro[ic] = jc;
-    dpMeio(centro, nx, nb, ic, jcg, nx - 1, jLo, nj);
-    dpMeio(centro, nx, nb, ic, jcg, 0,      jLo, nj);
-    return centro;
-}
-
-/* Uma metade da linha central, de iStart ate iEnd (em qualquer direcao).
-   Escreve o resultado em centro[]. */
-function dpMeio(centro, nx, nb, iStart, jcg, iEnd, jLo, nj) {
-    passo = 1;
-    if (iEnd < iStart) passo = -1;
-    nc = abs(iEnd - iStart) + 1;
-    if (nc < 2) return;
-    salto = passoColuna;
-    nk = floor((nc - 1) / salto) + 1;
-
-    D = newArray(nk * nj);
-    B = newArray(nk * nj);
-    for (j = 0; j < nj; j++) {
-        D[j] = 1e9;
-        B[j] = j;
-    }
-    D[jcg] = 0;
-
-    for (k = 1; k < nk; k++) {
-        col = iStart + k * salto * passo;
-        cur = k * nj;
-        prev = (k - 1) * nj;
-        for (j = 0; j < nj; j++) {
-            best = 1e9;
-            bk = j;
-            for (dj = -1; dj <= 1; dj++) {
-                m = j + dj;
-                if (m >= 0 && m < nj) {
-                    v = D[prev + m] + lambdaCentro * abs(dj);
-                    if (v < best) { best = v; bk = m; }
-                }
-            }
-            D[cur + j] = best + IMG[(jLo + j * passoLinha) * nx + col];
-            B[cur + j] = bk;
-        }
-    }
-
-    j = 0;
-    last = (nk - 1) * nj;
-    for (m = 1; m < nj; m++)
-        if (D[last + m] < D[last + j]) j = m;
-
-    // Retrocede guardando os nos e interpola entre eles.
-    nos = newArray(nk);
-    for (k = nk - 1; k >= 0; k--) {
-        nos[k] = jLo + j * passoLinha;
-        j = B[k * nj + j];
-    }
-    for (k = 0; k < nk - 1; k++) {
-        for (s = 0; s < salto; s++) {
-            i = iStart + (k * salto + s) * passo;
-            if (i >= 0 && i < nx) {
-                f = s / salto;
-                centro[i] = round(nos[k] * (1 - f) + nos[k + 1] * f);
-            }
-        }
-    }
-    for (i = iStart + (nk - 1) * salto * passo; i != iEnd + passo; i = i + passo) {
-        if (i >= 0 && i < nx) centro[i] = nos[nk - 1];
-    }
-}
-
-/* Primeira linha da faixa de busca de uma borda, coluna a coluna,
-   acompanhando a linha central. lado = -1 acima, +1 abaixo. */
-function faixaBorda(centro, nx, nb, lado, dIni, dFim, ny) {
-    tops = newArray(nx);
-    for (i = 0; i < nx; i++) {
-        if (lado < 0) t = centro[i] - dFim;
-        else          t = centro[i] + dIni;
-        if (t < 1) t = 1;
-        if (t + ny - 1 > nb - 2) t = nb - 2 - ny + 1;
-        tops[i] = t;
-    }
-    return tops;
-}
-
-/* Caminho de custo minimo sobre GRAD, na faixa de ny linhas que comeca em
-   tops[i]. O indice j segue a linha central, entao lambda pune o desvio em
-   relacao a curva do musculo, e nao a curvatura em si. */
-function caminho(nx, tops, i0, i1, ny, wantNegative) {
+/* Caminho de custo minimo nas colunas i0..i1, dentro da faixa de ny linhas
+   que comeca em tops[i] na coluna i. Retorna as ordenadas absolutas. */
+function caminho(grad, nx, bandTop, tops, i0, i1, ny, maxAbs, wantNegative) {
     nc = i1 - i0 + 1;
     if (nc < 2 || ny < 2) return newArray(0);
 
@@ -603,9 +477,9 @@ function caminho(nx, tops, i0, i1, ny, wantNegative) {
     D = newArray(nc * ny);
     B = newArray(nc * ny);
 
-    base = tops[i0] * nx + i0;
+    base = (tops[i0] - bandTop) * nx + i0;
     for (j = 0; j < ny; j++) {
-        D[j] = sgn * GRAD[base + j * nx] / gradMaxAbs;
+        D[j] = sgn * grad[base + j * nx] / maxAbs;
         B[j] = j;
     }
 
@@ -613,10 +487,13 @@ function caminho(nx, tops, i0, i1, ny, wantNegative) {
         col  = i0 + i;
         cur  = i * ny;
         prev = (i - 1) * ny;
+        // Deslocamento da faixa entre colunas vizinhas: o indice j segue a
+        // linha-base, entao a penalidade lambda pune o desvio EM RELACAO a
+        // inclinacao, e nao o simples fato de descer.
         desl = tops[col] - tops[col - 1];
-        gbase = tops[col] * nx + col;
+        gbase = (tops[col] - bandTop) * nx + col;
         for (j = 0; j < ny; j++) {
-            best  = 1e9;
+            best  = 999999;
             bestK = j;
             for (dj = -1; dj <= 1; dj++) {
                 k = j + dj + desl;
@@ -625,14 +502,14 @@ function caminho(nx, tops, i0, i1, ny, wantNegative) {
                     if (v < best) { best = v; bestK = k; }
                 }
             }
-            if (best > 999999998) {
+            if (best > 999998) {
                 k = j + desl;
                 if (k < 0) k = 0;
                 if (k > ny - 1) k = ny - 1;
                 best = D[prev + k] + lambda;
                 bestK = k;
             }
-            D[cur + j] = best + sgn * GRAD[gbase + j * nx] / gradMaxAbs;
+            D[cur + j] = best + sgn * grad[gbase + j * nx] / maxAbs;
             B[cur + j] = bestK;
         }
     }
