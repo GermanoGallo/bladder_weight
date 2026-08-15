@@ -4,16 +4,24 @@
 //  Nao grava nada: nem CSV, nem .roi, nem ROI Manager. Nao precisa ser
 //  instalada. Apenas traca as duas bordas e mostra as metricas.
 //
-//  COMO USAR (ImageJ.JS ou desktop)
-//    1. Abra a imagem de ultrassom.
-//    2. Plugins > New > Macro, cole este texto.
-//    3. Ctrl+R (Run).
-//    4. Clique dentro da faixa hipoecoica quando a barra de status pedir.
-//       (Ou, antes de rodar, marque o ponto com a ferramenta "point" —
-//        a macro usa esse ponto e nao espera clique.)
+//  COMO USAR (ImageJ.JS com ?run=)
+//    Publique este arquivo num Gist (https://gist.github.com) e abra:
+//      https://ij.imjoy.io/?run=<url_do_gist>
+//    A macro entra em espera assim que o app carrega. Abra a imagem
+//    normalmente (File > Open ou arrastando para a janela); a macro
+//    detecta a imagem sozinha e passa a responder aos cliques.
+//
+//  COMO USAR (rodando na mao)
+//    Plugins > New > Macro, colar, Ctrl+R. Funciona igual.
+//
+//  CLIQUES (sobre a imagem)
+//    clique simples        -> traca as bordas naquele ponto
+//    clique sobre um no    -> nao traca; arraste o no e as metricas sao
+//                             recalculadas quando voce solta
+//    Shift + clique        -> recalcula as metricas do ROI atual
+//    Alt + clique          -> encerra a macro
 //
 //  Saida: poligono na imagem + metricas na barra de status e na janela Log.
-//  Para repetir, basta rodar de novo (Ctrl+R).
 // =====================================================================
 
 // ------------------------------------------------------------- parametros
@@ -37,61 +45,107 @@ var lastUpperCount = -1;
 
 
 // ================================================================== inicio
+//  Laco residente: sobrevive a ausencia de imagem, porque com ?run= a macro
+//  comeca antes de o usuario abrir qualquer arquivo.
 
-if (nImages == 0) {
-    showMessage("Detrusor (teste)", "Abra uma imagem antes de rodar a macro.");
-} else {
-    ponto = pegaPonto();
-    if (ponto[0] < 0) {
-        showStatus("Detrusor: nenhum ponto informado.");
-    } else {
-        t0 = getTime();
+var LIMITE_MIN = 120;     // encerra sozinha apos este tempo de sessao (min)
 
-        cal = pixelSizeMm();
-        uncalibrated = (lengthOf(cal) < 2);
-        if (uncalibrated) cal = newArray(1.0, 1.0);
-        calX = cal[0];
-        calY = cal[1];
+print("\\Clear");
+print("Detrusor (teste) ativo.");
+print("  Abra uma imagem e clique dentro da faixa hipoecoica.");
+print("  Shift+clique recalcula, Alt+clique encerra.");
+showStatus("Detrusor: aguardando uma imagem...");
 
-        if (!trace(ponto[0], ponto[1])) {
-            showStatus("Detrusor: nao foi possivel tracar as bordas aqui.");
-            print("Detrusor: falha no tracado em (" + ponto[0] + ", " + ponto[1] + ").");
-            print("  Janela pequena demais ou clique perto demais da borda da imagem.");
-        } else {
-            dt = getTime() - t0;
-            relatorio(ponto[0], ponto[1], dt);
+fimSessao = getTime() + LIMITE_MIN * 60000;
+avisouImagem = false;
+rodando = true;
+
+while (rodando && getTime() < fimSessao) {
+    if (nImages == 0) {
+        if (!avisouImagem) {
+            showStatus("Detrusor: aguardando uma imagem...");
+            avisouImagem = true;
         }
+        wait(400);
+    } else {
+        if (avisouImagem) {
+            showStatus("Detrusor: clique dentro da faixa hipoecoica.");
+            setTool("polygon");        // permite arrastar os nos depois
+            avisouImagem = false;
+        }
+        getCursorLoc(cx, cy, cz, flags);
+        if ((flags & 16) != 0) {                   // botao esquerdo
+            alt   = ((flags & 8) != 0) || ((flags & 4) != 0);
+            shift = ((flags & 1) != 0);
+            soltaBotao();
+            if (alt) {
+                rodando = false;
+            } else if (shift) {
+                if (selectionType() == 2) relatorio(-1, -1, -1);
+                else showStatus("Detrusor: nao ha poligono para recalcular.");
+            } else if (sobreNo(cx, cy)) {
+                // clique em cima de um no: deixa o usuario arrastar e so
+                // recalcula ao final do arraste
+                if (selectionType() == 2) relatorio(-1, -1, -1);
+            } else {
+                mede(cx, cy);
+            }
+        }
+        wait(30);
     }
 }
 
+if (rodando) print("Detrusor: sessao encerrada por tempo (" + LIMITE_MIN + " min).");
+else print("Detrusor: encerrado pelo usuario.");
+showStatus("Detrusor: encerrado.");
 
-// ============================================== ponto de partida do tracado
 
-/* Usa uma selecao de ponto ja existente; senao espera um clique.
-   Retorna [x, y], ou [-1, -1] se desistir. */
-function pegaPonto() {
-    if (selectionType() == 10) {          // point selection
-        Roi.getCoordinates(sx, sy);
-        if (lengthOf(sx) > 0) {
-            run("Select None");
-            return newArray(sx[0], sy[0]);
-        }
-    }
-    showStatus("Detrusor: clique dentro da faixa hipoecoica (60 s)...");
-    limite = getTime() + 60000;
+// ============================================================ laco auxiliar
+
+/* Espera o botao ser solto, com teto de 5 s (em alguns ambientes o evento
+   de soltar ainda traz o bit do botao ligado). */
+function soltaBotao() {
+    limite = getTime() + 5000;
     while (getTime() < limite) {
-        getCursorLoc(cx, cy, cz, flags);
-        if ((flags & 16) != 0) {           // botao esquerdo pressionado
-            // espera soltar, para nao confundir com arraste
-            while ((flags & 16) != 0) {
-                wait(10);
-                getCursorLoc(dx2, dy2, dz2, flags);
-            }
-            return newArray(cx, cy);
-        }
+        getCursorLoc(ax, ay, az, f2);
+        if ((f2 & 16) == 0) break;
         wait(20);
     }
-    return newArray(-1, -1);
+    wait(120);
+}
+
+/* True se o clique caiu sobre um vertice do poligono corrente. */
+function sobreNo(xc, yc) {
+    if (selectionType() != 2) return false;
+    Roi.getCoordinates(vx, vy);
+    tol = 6;
+    z = getZoom();
+    if (z > 0) tol = 6 / z;
+    if (tol < 3) tol = 3;
+    for (i = 0; i < lengthOf(vx); i++) {
+        dx = vx[i] - xc;
+        dy = vy[i] - yc;
+        if (sqrt(dx * dx + dy * dy) <= tol) return true;
+    }
+    return false;
+}
+
+/* Traca e mede a partir de um ponto. */
+function mede(xc, yc) {
+    t0 = getTime();
+    cal = pixelSizeMm();
+    uncalibrated = (lengthOf(cal) < 2);
+    if (uncalibrated) cal = newArray(1.0, 1.0);
+    calX = cal[0];
+    calY = cal[1];
+
+    if (!trace(xc, yc)) {
+        showStatus("Detrusor: nao foi possivel tracar as bordas aqui.");
+        print("Detrusor: falha no tracado em (" + xc + ", " + yc + ").");
+        print("  Janela pequena demais ou clique perto demais da borda da imagem.");
+    } else {
+        relatorio(xc, yc, getTime() - t0);
+    }
 }
 
 
@@ -129,7 +183,8 @@ function relatorio(xc, yc, dt) {
     Overlay.show;
 
     print("--- Detrusor (teste) -------------------------------");
-    print("  clique          : (" + xc + ", " + yc + ")");
+    if (xc >= 0) print("  clique          : (" + xc + ", " + yc + ")");
+    else         print("  (recalculo do ROI corrente)");
     if (uncalibrated)
         print("  calibracao      : NENHUMA (medidas em pixels)");
     else
@@ -139,7 +194,7 @@ function relatorio(xc, yc, dt) {
     print("  RAF (Fmax/Fmin) : " + d2s(raf, 2));
     if (!isNaN(dperp)) print("  Dperp           : " + d2s(dperp, 4) + " " + u);
     print("  vertices        : " + n + " (" + lastUpperCount + " por borda)");
-    print("  tempo           : " + dt + " ms");
+    if (dt >= 0) print("  tempo           : " + dt + " ms");
 }
 
 
