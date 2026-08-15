@@ -116,21 +116,20 @@ var CSV_HEADER =
 // ============================================================ ferramentas
 
 macro "Detrusor Tracer Tool - C037L0a7aL0d7dCf00O6455" {
-    if (nImages == 0) exit;
-    getCursorLoc(cx, cy, cz, flags);
+    if (nImages > 0) {
+        getCursorLoc(cx, cy, cz, flags);
 
-    // flags: 16 = botao esquerdo, 8 = alt, 4 = botao direito, 2 = ctrl, 1 = shift
-    grava = ((flags & 8) != 0) || ((flags & 4) != 0);
-    if (grava) {
-        commitMeasurement();
-        exit;
+        // flags: 16 = botao esquerdo, 8 = alt, 4 = botao direito, 2 = ctrl, 1 = shift
+        grava = ((flags & 8) != 0) || ((flags & 4) != 0);
+        if (grava) {
+            commitMeasurement();
+        } else {
+            // Um novo tracado com medida pendente: grava a anterior antes.
+            if (pendingOpen && getImageID() == lastImageID)
+                commitMeasurement();
+            doTrace(cx, cy);
+        }
     }
-
-    // Um novo tracado com medida pendente: grava a anterior antes.
-    if (pendingOpen && getImageID() == lastImageID)
-        commitMeasurement();
-
-    doTrace(cx, cy);
 }
 
 macro "Detrusor Tracer Tool Options" {
@@ -138,13 +137,11 @@ macro "Detrusor Tracer Tool Options" {
 }
 
 macro "Detrusor: gravar medida [g]" {
-    if (nImages == 0) exit;
-    commitMeasurement();
+    if (nImages > 0) commitMeasurement();
 }
 
 macro "Detrusor: recalcular metricas [r]" {
-    if (nImages == 0) exit;
-    reportRoi();
+    if (nImages > 0) reportRoi();
 }
 
 macro "Detrusor: ativar ferramenta [t]" {
