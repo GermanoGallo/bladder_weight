@@ -34,6 +34,10 @@
 //    - Espessura fora de 0.25 a 0.95 mm sinaliza revisao.
 //    - lambda e blur mantidos: as bordas automaticas ja saem mais suaves
 //      que as corrigidas a mao.
+//    - A linha-base da busca acompanha a inclinacao local (estimada em uma
+//      passada piloto no trecho central). Com linha-base horizontal, um
+//      detrusor obliquo escapa da janela e o poligono corta a parede em
+//      diagonal, inflando o Dperp.
 // =====================================================================
 
 // ------------------------------------------------------------- parametros
@@ -67,6 +71,13 @@ var espMaxMm            = 0.95;
 // Fracao das colunas que pode encostar no limite da janela antes de o
 // tracado ser considerado saturado (indicador causal de fuga da borda).
 var satTolerancia       = 0.05;
+// A linha-base da busca acompanha a inclinacao local do detrusor. Sem isso,
+// numa faixa obliqua a janela de +-0.70 mm e vencida pela deriva: a 20 graus
+// o detrusor desce ~1.5 mm ao longo dos 4 mm de janela.
+var seguirInclinacao    = true;
+var inclinacaoMax       = 0.70;   // dy/dx maximo aceito (~35 graus)
+var inclinacaoMin       = 0.05;   // abaixo disso trata como horizontal
+var fracaoPiloto        = 0.35;   // trecho central usado para medir a inclinacao
 
 // ------------------------------------------------------------ estado interno
 var calX = 1.0;
@@ -77,6 +88,10 @@ var lastUpperCount = -1;
 // janela de busca. Preenchido por trace(), lido por relatorio().
 var satSup = 0;
 var satInf = 0;
+// Inclinacao (dy/dx) estimada para a linha-base e maximo absoluto do
+// gradiente da faixa extraida.
+var inclinacaoAtual = 0;
+var gradMaxAbs = 1;
 
 
 // ================================================================== inicio
@@ -260,6 +275,8 @@ function relatorio(xc, yc, dt, imprime) {
         print("  RAF (Fmax/Fmin) : " + d2s(raf, 2));
         print("  saturacao       : sup " + d2s(satSup * 100, 0)
               + "%  inf " + d2s(satInf * 100, 0) + "% das colunas");
+        print("  inclinacao      : " + d2s(inclinacaoAtual, 3) + " dy/dx  ("
+              + d2s(atan(inclinacaoAtual) * 180 / PI, 1) + " graus)");
         if (lengthOf(alerta) > 0) print("  QC              : REVISAR ->" + alerta);
         else                      print("  QC              : ok");
         print("  vertices        : " + n + " (" + lastUpperCount + " por borda)");
@@ -269,6 +286,16 @@ function relatorio(xc, yc, dt, imprime) {
 
 
 // =================================================================== tracado
+//  A busca segue uma linha-base INCLINADA, nao a horizontal. Sem isso, num
+//  detrusor obliquo a faixa sai da janela ao longo dos 4 mm e o poligono
+//  atravessa a parede em vez de acompanha-la (Dperp inflado, RAF baixo).
+//
+//  Duas passadas:
+//    1. janela horizontal estreita, linha-base horizontal, so para estimar
+//       a inclinacao local pela linha media entre as duas bordas;
+//    2. janela completa, linha-base inclinada por essa estimativa.
+//  O gradiente e extraido uma unica vez, numa faixa alta o bastante para
+//  comportar a deriva maxima admitida.
 
 function trace(xc, yc) {
     w = getWidth();
@@ -287,63 +314,68 @@ function trace(xc, yc) {
     x0 = maxOf(1, xc - halfW);
     x1 = minOf(w - 2, xc + halfW);
     if (x1 - x0 < 8) return false;
+    nx = x1 - x0 + 1;
 
-    yUpTop = maxOf(1, yc - maxHalf);
-    yUpBot = maxOf(1, yc - minHalfThicknessPx);
-    yLoTop = minOf(h - 2, yc + minHalfThicknessPx);
-    yLoBot = minOf(h - 2, yc + maxHalf);
-    if (yUpBot <= yUpTop || yLoBot <= yLoTop) return false;
+    // Faixa vertical a extrair: espessura buscada + deriva maxima da
+    // linha-base inclinada nas extremidades da janela.
+    deriva  = round(inclinacaoMax * maxOf(xc - x0, x1 - xc));
+    bandTop = maxOf(1,     yc - maxHalf - deriva);
+    bandBot = minOf(h - 2, yc + maxHalf + deriva);
+    nb = bandBot - bandTop + 1;
+    if (nb < 2 * minHalfThicknessPx + 4) return false;
 
-    nx      = x1 - x0 + 1;
-    bandTop = yUpTop;
-    nb      = yLoBot - yUpTop + 1;
+    grad = gradienteVertical(x0, nx, bandTop, nb, h);
+    if (lengthOf(grad) == 0) return false;
+    maxAbs = gradMaxAbs;
 
-    // copia 32-bit, anti-speckle e gradiente vertical por convolucao
-    origID = getImageID();
-    setBatchMode(true);
-    run("Select None");
-    run("Duplicate...", "title=DETRUSOR_TMP");
-    tmpID = getImageID();
-    run("32-bit");
-    if (blurSigma > 0) run("Gaussian Blur...", "sigma=" + blurSigma);
-    run("Convolve...", "text1=[0 -1 0\n0 0 0\n0 1 0\n]");   // f(y+1) - f(y-1)
+    ny = maxHalf - minHalfThicknessPx + 1;
+    if (ny < 2) return false;
 
-    makeRectangle(x0, 1, nx, h - 2);
-    getStatistics(aTmp, mTmp, gMin, gMax);
-    maxAbs = maxOf(abs(gMin), abs(gMax));
-    if (maxAbs < 0.000001) maxAbs = 0.000001;
-
-    grad = newArray(nx * nb);
-    for (j = 0; j < nb; j++) {
-        makeRectangle(x0, bandTop + j, nx, 1);
-        p = getProfile();
-        off = j * nx;
-        for (i = 0; i < nx; i++) grad[off + i] = p[i];
+    // ---- passada 1: inclinacao a partir de um trecho central curto ------
+    inclin = 0;
+    if (seguirInclinacao) {
+        meia = round(nx * fracaoPiloto / 2);
+        if (meia < 6) meia = 6;
+        ia = maxOf(0, round((xc - x0)) - meia);
+        ib = minOf(nx - 1, round((xc - x0)) + meia);
+        if (ib - ia >= 8) {
+            t1s = baseLinha(x0, nx, xc, yc, 0, -1, maxHalf, minHalfThicknessPx, bandTop, bandBot);
+            t1i = baseLinha(x0, nx, xc, yc, 0,  1, minHalfThicknessPx, maxHalf, bandTop, bandBot);
+            p1s = caminho(grad, nx, bandTop, t1s, ia, ib, ny, maxAbs, true);
+            p1i = caminho(grad, nx, bandTop, t1i, ia, ib, ny, maxAbs, false);
+            if (lengthOf(p1s) > 0 && lengthOf(p1i) > 0) {
+                nc = ib - ia + 1;
+                mid = newArray(nc);
+                for (i = 0; i < nc; i++) mid[i] = (p1s[i] + p1i[i]) / 2;
+                inclin = ajusteReta(mid);
+                if (inclin >  inclinacaoMax) inclin =  inclinacaoMax;
+                if (inclin < -inclinacaoMax) inclin = -inclinacaoMax;
+                if (abs(inclin) < inclinacaoMin) inclin = 0;
+            }
+        }
     }
-    run("Select None");
-    selectImage(tmpID);
-    close();
-    selectImage(origID);
-    setBatchMode(false);
+    inclinacaoAtual = inclin;
 
-    upper = dynamicPath(grad, nx, bandTop, yUpTop, yUpBot, maxAbs, true);
-    lower = dynamicPath(grad, nx, bandTop, yLoTop, yLoBot, maxAbs, false);
+    // ---- passada 2: janela completa sobre a linha-base inclinada --------
+    topsSup = baseLinha(x0, nx, xc, yc, inclin, -1, maxHalf, minHalfThicknessPx, bandTop, bandBot);
+    topsInf = baseLinha(x0, nx, xc, yc, inclin,  1, minHalfThicknessPx, maxHalf, bandTop, bandBot);
+
+    upper = caminho(grad, nx, bandTop, topsSup, 0, nx - 1, ny, maxAbs, true);
+    lower = caminho(grad, nx, bandTop, topsInf, 0, nx - 1, ny, maxAbs, false);
     if (lengthOf(upper) == 0 || lengthOf(lower) == 0) return false;
-
-    // Saturacao: quantas colunas encostaram no limite da janela de busca.
-    // Uma borda colada no limite quase sempre significa que a programacao
-    // dinamica fugiu do detrusor e foi atras de um gradiente mais forte.
-    nSup = 0;
-    nInf = 0;
-    for (i = 0; i < nx; i++) {
-        if (upper[i] <= yUpTop) nSup++;
-        if (lower[i] >= yLoBot) nInf++;
-    }
-    satSup = nSup / nx;
-    satInf = nInf / nx;
 
     for (i = 0; i < nx; i++)
         if (lower[i] <= upper[i]) lower[i] = upper[i] + 1;
+
+    // Saturacao medida contra os limites de CADA coluna, ja inclinados.
+    nSup = 0;
+    nInf = 0;
+    for (i = 0; i < nx; i++) {
+        if (upper[i] <= topsSup[i])          nSup++;
+        if (lower[i] >= topsInf[i] + ny - 1) nInf++;
+    }
+    satSup = nSup / nx;
+    satInf = nInf / nx;
 
     up = resamplePath(x0, upper, nodesPerBorder);
     lo = resamplePath(x0, lower, nodesPerBorder);
@@ -366,49 +398,130 @@ function trace(xc, yc) {
     return true;
 }
 
-/* Caminho de custo minimo entre yTop e yBot, coluna a coluna. */
-function dynamicPath(grad, nx, bandTop, yTop, yBot, maxAbs, wantNegative) {
-    ny = yBot - yTop + 1;
-    if (nx < 2 || ny < 2) return newArray(0);
+/* Limite superior da faixa de busca em cada coluna, seguindo a linha-base
+   inclinada. lado = -1 para a borda de cima, +1 para a de baixo.
+   dIni/dFim sao as distancias, em pixels, da linha-base ate o inicio e o
+   fim da faixa daquele lado. Retorna o y absoluto da linha j = 0. */
+function baseLinha(x0, nx, xc, yc, inclin, lado, dIni, dFim, bandTop, bandBot) {
+    tops = newArray(nx);
+    ny = dFim - dIni + 1;
+    for (i = 0; i < nx; i++) {
+        c = yc + inclin * (x0 + i - xc);
+        if (lado < 0) t = round(c) - dFim;      // de -dFim ate -dIni
+        else          t = round(c) + dIni;      // de +dIni ate +dFim
+        if (t < bandTop) t = bandTop;
+        if (t + ny - 1 > bandBot) t = bandBot - ny + 1;
+        tops[i] = t;
+    }
+    return tops;
+}
+
+/* Inclinacao (dy/dx) por minimos quadrados sobre a linha media. */
+function ajusteReta(y) {
+    n = lengthOf(y);
+    if (n < 3) return 0;
+    sx = 0; sy = 0; sxx = 0; sxy = 0;
+    for (i = 0; i < n; i++) {
+        sx  = sx + i;
+        sy  = sy + y[i];
+        sxx = sxx + i * i;
+        sxy = sxy + i * y[i];
+    }
+    den = n * sxx - sx * sx;
+    if (abs(den) < 1e-9) return 0;
+    return (n * sxy - sx * sy) / den;
+}
+
+/* Extrai o gradiente vertical da faixa e guarda o maximo absoluto em
+   gradMaxAbs. Uma copia 32-bit, blur anti-speckle e convolucao
+   0 -1 0 / 0 0 0 / 0 1 0, que equivale a f(x,y+1) - f(x,y-1). */
+function gradienteVertical(x0, nx, bandTop, nb, h) {
+    origID = getImageID();
+    setBatchMode(true);
+    run("Select None");
+    run("Duplicate...", "title=DETRUSOR_TMP");
+    tmpID = getImageID();
+    run("32-bit");
+    if (blurSigma > 0) run("Gaussian Blur...", "sigma=" + blurSigma);
+    run("Convolve...", "text1=[0 -1 0\n0 0 0\n0 1 0\n]");
+
+    makeRectangle(x0, 1, nx, h - 2);
+    getStatistics(aTmp, mTmp, gMin, gMax);
+    gradMaxAbs = maxOf(abs(gMin), abs(gMax));
+    if (gradMaxAbs < 0.000001) gradMaxAbs = 0.000001;
+
+    g = newArray(nx * nb);
+    for (j = 0; j < nb; j++) {
+        makeRectangle(x0, bandTop + j, nx, 1);
+        p = getProfile();
+        off = j * nx;
+        for (i = 0; i < nx; i++) g[off + i] = p[i];
+    }
+    run("Select None");
+    selectImage(tmpID);
+    close();
+    selectImage(origID);
+    setBatchMode(false);
+    return g;
+}
+
+/* Caminho de custo minimo nas colunas i0..i1, dentro da faixa de ny linhas
+   que comeca em tops[i] na coluna i. Retorna as ordenadas absolutas. */
+function caminho(grad, nx, bandTop, tops, i0, i1, ny, maxAbs, wantNegative) {
+    nc = i1 - i0 + 1;
+    if (nc < 2 || ny < 2) return newArray(0);
 
     sgn = -1;
     if (wantNegative) sgn = 1;
-    dy0 = yTop - bandTop;
 
-    D = newArray(nx * ny);
-    B = newArray(nx * ny);
+    D = newArray(nc * ny);
+    B = newArray(nc * ny);
 
+    base = (tops[i0] - bandTop) * nx + i0;
     for (j = 0; j < ny; j++) {
-        D[j] = sgn * grad[(dy0 + j) * nx] / maxAbs;
+        D[j] = sgn * grad[base + j * nx] / maxAbs;
         B[j] = j;
     }
-    for (i = 1; i < nx; i++) {
+
+    for (i = 1; i < nc; i++) {
+        col  = i0 + i;
         cur  = i * ny;
         prev = (i - 1) * ny;
+        // Deslocamento da faixa entre colunas vizinhas: o indice j segue a
+        // linha-base, entao a penalidade lambda pune o desvio EM RELACAO a
+        // inclinacao, e nao o simples fato de descer.
+        desl = tops[col] - tops[col - 1];
+        gbase = (tops[col] - bandTop) * nx + col;
         for (j = 0; j < ny; j++) {
-            best  = D[prev + j];
+            best  = 999999;
             bestK = j;
-            if (j > 0) {
-                v = D[prev + j - 1] + lambda;
-                if (v < best) { best = v; bestK = j - 1; }
+            for (dj = -1; dj <= 1; dj++) {
+                k = j + dj + desl;
+                if (k >= 0 && k < ny) {
+                    v = D[prev + k] + lambda * abs(dj);
+                    if (v < best) { best = v; bestK = k; }
+                }
             }
-            if (j < ny - 1) {
-                v = D[prev + j + 1] + lambda;
-                if (v < best) { best = v; bestK = j + 1; }
+            if (best > 999998) {
+                k = j + desl;
+                if (k < 0) k = 0;
+                if (k > ny - 1) k = ny - 1;
+                best = D[prev + k] + lambda;
+                bestK = k;
             }
-            D[cur + j] = best + sgn * grad[(dy0 + j) * nx + i] / maxAbs;
+            D[cur + j] = best + sgn * grad[gbase + j * nx] / maxAbs;
             B[cur + j] = bestK;
         }
     }
 
-    last = (nx - 1) * ny;
+    last = (nc - 1) * ny;
     j = 0;
     for (k = 1; k < ny; k++)
         if (D[last + k] < D[last + j]) j = k;
 
-    path = newArray(nx);
-    for (i = nx - 1; i >= 0; i--) {
-        path[i] = yTop + j;
+    path = newArray(nc);
+    for (i = nc - 1; i >= 0; i--) {
+        path[i] = tops[i0 + i] + j;
         j = B[i * ny + j];
     }
     return path;
@@ -429,7 +542,6 @@ function resamplePath(x0, path, n) {
     }
     return out;
 }
-
 
 // ================================================================== metricas
 
