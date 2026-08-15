@@ -1,180 +1,150 @@
 // =====================================================================
-//  Detrusor_Tracer.ijm   -   versao macro (IJ1) do plugin Detrusor_Tracer.java
+//  Detrusor_Teste.ijm  -  versao minima, so para testar o algoritmo
 //
-//  Mensuracao semiautomatica da espessura da parede vesical / detrusor
-//  em ultrassonografia de alta frequencia.
+//  Nao grava nada: nem CSV, nem .roi, nem ROI Manager. Nao precisa ser
+//  instalada. Apenas traca as duas bordas e mostra as metricas.
 //
-//  INSTALACAO
-//    Plugins > Macros > Install...   (ou salvar em ImageJ/macros/toolsets/
-//    e escolher o toolset no menu ">>" da barra de ferramentas)
+//  COMO USAR (ImageJ.JS ou desktop)
+//    1. Abra a imagem de ultrassom.
+//    2. Plugins > New > Macro, cole este texto.
+//    3. Ctrl+R (Run).
+//    4. Clique dentro da faixa hipoecoica quando a barra de status pedir.
+//       (Ou, antes de rodar, marque o ponto com a ferramenta "point" —
+//        a macro usa esse ponto e nao espera clique.)
 //
-//  FLUXO
-//    Clique esquerdo dentro da faixa hipoecoica -> traca o poligono automatico
-//                                                 e passa para a ferramenta
-//                                                 poligono (arraste os nos).
-//    Tecla [r]                                 -> recalcula as metricas do ROI.
-//    Tecla [g]  (ou Alt+clique / botao direito
-//                com a ferramenta ativa)       -> GRAVA a medida.
-//    Tecla [t]                                 -> volta para a ferramenta.
-//    Duplo clique no icone da ferramenta       -> opcoes.
-//
-//  O que e gravado a cada medida:
-//    - uma linha no CSV de calibracao (esquema identico ao da planilha manual);
-//    - o ROI automatico  (..._auto.roi);
-//    - o ROI corrigido   (..._final.roi).
-//
-//  Nenhum identificador do paciente e gravado: apenas o nome do arquivo de
-//  imagem e o numero do caso informado pelo operador.
-//
-//  Metricas:
-//    Fmin  - diametro minimo de Feret (envoltorio convexo), calibrado.
-//    Fmax  - diametro maximo de Feret.
-//    RAF   - Fmax/Fmin. RAF < 3 sinaliza revisao.
-//    Dperp - distancia perpendicular media entre as duas bordas tracadas.
-//
-//  Calibracao: prioriza a Sequence of Ultrasound Regions do DICOM
-//  (0018,602C / 0018,602E, cm/pixel), com fallback para Pixel Spacing
-//  (0028,0030, mm) e depois para a calibracao do ImageJ.
-//
-//  DIFERENCAS EM RELACAO AO PLUGIN JAVA (limitacoes da linguagem de macro)
-//    1. Nao existe RoiListener: as metricas nao sao recalculadas ao vivo
-//       durante o arraste dos nos. Use [r] para recalcular quando quiser
-//       (a gravacao sempre recalcula a partir do ROI corrente, entao o
-//       valor gravado continua correto mesmo sem apertar [r]).
-//    2. O cancelamento de um dialogo aborta a macro (o ImageJ nao permite
-//       detectar o cancelamento); a medida pendente continua pendente.
-//    3. O gradiente vertical e obtido por convolucao (kernel 0 -1 0 /
-//       0 0 0 / 0 1 0) em uma copia 32-bit, em vez de laco pixel a pixel,
-//       por desempenho. O resultado numerico e o mesmo.
+//  Saida: poligono na imagem + metricas na barra de status e na janela Log.
+//  Para repetir, basta rodar de novo (Ctrl+R).
 // =====================================================================
 
+// ------------------------------------------------------------- parametros
+// Ajuste aqui e rode de novo para comparar resultados.
 
-// ---------------------------------------------------------------- opcoes
-
-var halfWidthMm         = 4.0;
-var maxHalfThicknessMm  = 1.2;
+var halfWidthMm         = 4.0;    // meia-largura da janela, imagem calibrada
+var maxHalfThicknessMm  = 1.2;    // espessura maxima buscada, calibrada
+var halfWidthPx         = 170;    // meia-largura, imagem SEM calibracao
+var maxHalfThicknessPx  = 50;     // espessura maxima, imagem SEM calibracao
 var minHalfThicknessPx  = 2;
-var lambda              = 0.60;
-var blurSigma           = 1.0;
-var nodesPerBorder      = 12;
-var rafThreshold        = 3.0;
-// Deslocamento minimo, em pixels, para considerar um no como movido.
-var movedNodeTolPx      = 0.5;
-// Janela usada quando a imagem NAO tem calibracao (modo pixel).
-var halfWidthPx         = 170;
-var maxHalfThicknessPx  = 50;
-// True quando a medida corrente esta em pixels, nao em mm.
-var uncalibrated        = false;
-// Se falso, reaproveita os rotulos da medida anterior sem abrir dialogo.
-var askEachTime         = true;
-// Passa automaticamente para a ferramenta poligono apos tracar.
-var switchToPolygon     = true;
+var lambda              = 0.60;   // suavidade do caminho
+var blurSigma           = 1.0;    // blur anti-speckle, em pixels
+var nodesPerBorder      = 12;     // nos por borda
+var rafThreshold        = 3.0;    // limiar de RAF para sinalizar revisao
 
-// ------------------------------------------------------- estado da medida
-
-var autoX = newArray(0);      // poligono automatico (pixels)
-var autoY = newArray(0);
-var autoN = 0;
-var clickX = -1;
-var clickY = -1;
-var calX = 1.0;               // mm por pixel em x
-var calY = 1.0;               // mm por pixel em y
-var pendingImageName = "";
-var pendingOpen = false;
+// ------------------------------------------------------------ estado interno
+var calX = 1.0;
+var calY = 1.0;
+var uncalibrated = false;
 var lastUpperCount = -1;
-var lastImageID = 0;
-
-// ------------------------------------------- rotulos clinicos (persistem)
-
-var caso = 0;
-var incidenciaIdx = 0;
-var momentoIdx = 0;
-var estruturaIdx = 0;
-var qualidadeIdx = 0;
-var freqMHz = 30;
-var profundidadeCm = 0.8;
-var volMic1 = 0;
-var volMic2 = 0;
-var fminRelatorio = 0;
-var obs = "";
-
-var INCIDENCIAS = newArray("sagital", "transversal_D", "transversal_E");
-var MOMENTOS    = newArray("pre", "pos_miccao1", "pos_miccao2");
-var ESTRUTURAS  = newArray("detrusor", "parede");
-var QUALIDADES  = newArray("boa", "regular", "ruim");
-
-var CSV_HEADER =
-     "caso,arquivo_imagem,incidencia,momento,estrutura,"
-   + "fmin_auto_mm,fmin_final_mm,ajustou,nos_movidos,qualidade,"
-   + "roi_auto,roi_final,dperp_auto_mm,dperp_final_mm,raf_auto,raf_final,"
-   + "desloc_medio_mm,desloc_max_mm,"
-   + "lambda,blur_sigma,meia_largura_mm,esp_max_mm,clique_x,clique_y,"
-   + "freq_MHz,profundidade_cm,px_mm_x,px_mm_y,vol_mic1_mL,vol_mic2_mL,"
-   + "fmin_relatorio_mm,timestamp,obs";
 
 
-// ============================================================ ferramentas
+// ================================================================== inicio
 
-macro "Detrusor Tracer Tool - C037L0a7aL0d7dCf00O6455" {
-    if (nImages > 0) {
-        getCursorLoc(cx, cy, cz, flags);
+if (nImages == 0) {
+    showMessage("Detrusor (teste)", "Abra uma imagem antes de rodar a macro.");
+} else {
+    ponto = pegaPonto();
+    if (ponto[0] < 0) {
+        showStatus("Detrusor: nenhum ponto informado.");
+    } else {
+        t0 = getTime();
 
-        // flags: 16 = botao esquerdo, 8 = alt, 4 = botao direito, 2 = ctrl, 1 = shift
-        grava = ((flags & 8) != 0) || ((flags & 4) != 0);
-        if (grava) {
-            commitMeasurement();
+        cal = pixelSizeMm();
+        uncalibrated = (lengthOf(cal) < 2);
+        if (uncalibrated) cal = newArray(1.0, 1.0);
+        calX = cal[0];
+        calY = cal[1];
+
+        if (!trace(ponto[0], ponto[1])) {
+            showStatus("Detrusor: nao foi possivel tracar as bordas aqui.");
+            print("Detrusor: falha no tracado em (" + ponto[0] + ", " + ponto[1] + ").");
+            print("  Janela pequena demais ou clique perto demais da borda da imagem.");
         } else {
-            // Um novo tracado com medida pendente: grava a anterior antes.
-            if (pendingOpen && getImageID() == lastImageID)
-                commitMeasurement();
-            doTrace(cx, cy);
+            dt = getTime() - t0;
+            relatorio(ponto[0], ponto[1], dt);
         }
     }
 }
 
-macro "Detrusor Tracer Tool Options" {
-    showOptionsDialog();
-}
 
-macro "Detrusor: gravar medida [g]" {
-    if (nImages > 0) commitMeasurement();
-}
+// ============================================== ponto de partida do tracado
 
-macro "Detrusor: recalcular metricas [r]" {
-    if (nImages > 0) reportRoi();
-}
-
-macro "Detrusor: ativar ferramenta [t]" {
-    setTool("Detrusor Tracer");
-}
-
-
-// ================================================================= tracado
-
-function doTrace(xc, yc) {
-    cal = pixelSizeMm();
-    uncalibrated = (lengthOf(cal) < 2);
-    if (uncalibrated) cal = newArray(1.0, 1.0);
-    calX = cal[0];
-    calY = cal[1];
-
-    if (!trace(xc, yc)) {
-        showStatus("Detrusor: nao foi possivel tracar as bordas aqui.");
-        return;
+/* Usa uma selecao de ponto ja existente; senao espera um clique.
+   Retorna [x, y], ou [-1, -1] se desistir. */
+function pegaPonto() {
+    if (selectionType() == 10) {          // point selection
+        Roi.getCoordinates(sx, sy);
+        if (lengthOf(sx) > 0) {
+            run("Select None");
+            return newArray(sx[0], sy[0]);
+        }
     }
-
-    clickX = xc;
-    clickY = yc;
-    pendingImageName = imageBaseName();
-    pendingOpen = true;
-    lastImageID = getImageID();
-
-    reportRoi();
-    if (switchToPolygon) setTool("polygon");
+    showStatus("Detrusor: clique dentro da faixa hipoecoica (60 s)...");
+    limite = getTime() + 60000;
+    while (getTime() < limite) {
+        getCursorLoc(cx, cy, cz, flags);
+        if ((flags & 16) != 0) {           // botao esquerdo pressionado
+            // espera soltar, para nao confundir com arraste
+            while ((flags & 16) != 0) {
+                wait(10);
+                getCursorLoc(dx2, dy2, dz2, flags);
+            }
+            return newArray(cx, cy);
+        }
+        wait(20);
+    }
+    return newArray(-1, -1);
 }
 
-/* Traca as duas bordas e instala o poligono como selecao corrente.
-   Retorna true em caso de sucesso. */
+
+// ================================================================= relatorio
+
+function relatorio(xc, yc, dt) {
+    Roi.getCoordinates(fx, fy);
+    n = lengthOf(fx);
+
+    fer  = feretMinMax(fx, fy, n);
+    fmin = fer[0];
+    fmax = fer[1];
+    raf  = NaN;
+    if (fmin > 0) raf = fmax / fmin;
+
+    dperp = NaN;
+    if (lastUpperCount > 0 && n == lastUpperCount * 2)
+        dperp = meanPerpendicular(fx, fy, n, lastUpperCount);
+
+    u = "mm";
+    if (uncalibrated) u = "px";
+
+    s = "Fmin " + d2s(fmin, 3) + " " + u;
+    if (uncalibrated) s = s + "  (SEM CALIBRACAO)";
+    if (!isNaN(dperp)) s = s + "  |  Dperp " + d2s(dperp, 3) + " " + u;
+    s = s + "  |  RAF " + d2s(raf, 1);
+    if (raf < rafThreshold) s = s + "  << REVISAR";
+    showStatus(s);
+
+    Overlay.remove;
+    setFont("SansSerif", 13);
+    if (raf < rafThreshold) setColor("orange"); else setColor("yellow");
+    Roi.getBounds(bx, by, bw, bh);
+    Overlay.drawString(s, bx, maxOf(14, by - 8));
+    Overlay.show;
+
+    print("--- Detrusor (teste) -------------------------------");
+    print("  clique          : (" + xc + ", " + yc + ")");
+    if (uncalibrated)
+        print("  calibracao      : NENHUMA (medidas em pixels)");
+    else
+        print("  calibracao      : " + d2s(calX, 5) + " x " + d2s(calY, 5) + " mm/px");
+    print("  Fmin            : " + d2s(fmin, 4) + " " + u);
+    print("  Fmax            : " + d2s(fmax, 4) + " " + u);
+    print("  RAF (Fmax/Fmin) : " + d2s(raf, 2));
+    if (!isNaN(dperp)) print("  Dperp           : " + d2s(dperp, 4) + " " + u);
+    print("  vertices        : " + n + " (" + lastUpperCount + " por borda)");
+    print("  tempo           : " + dt + " ms");
+}
+
+
+// =================================================================== tracado
+
 function trace(xc, yc) {
     w = getWidth();
     h = getHeight();
@@ -203,7 +173,7 @@ function trace(xc, yc) {
     bandTop = yUpTop;
     nb      = yLoBot - yUpTop + 1;
 
-    // --- copia 32-bit, anti-speckle e gradiente vertical -----------------
+    // copia 32-bit, anti-speckle e gradiente vertical por convolucao
     origID = getImageID();
     setBatchMode(true);
     run("Select None");
@@ -211,8 +181,7 @@ function trace(xc, yc) {
     tmpID = getImageID();
     run("32-bit");
     if (blurSigma > 0) run("Gaussian Blur...", "sigma=" + blurSigma);
-    // g(x,y) = f(x,y+1) - f(x,y-1)
-    run("Convolve...", "text1=[0 -1 0\n0 0 0\n0 1 0\n]");
+    run("Convolve...", "text1=[0 -1 0\n0 0 0\n0 1 0\n]");   // f(y+1) - f(y-1)
 
     makeRectangle(x0, 1, nx, h - 2);
     getStatistics(aTmp, mTmp, gMin, gMax);
@@ -232,7 +201,6 @@ function trace(xc, yc) {
     selectImage(origID);
     setBatchMode(false);
 
-    // --- programacao dinamica -------------------------------------------
     upper = dynamicPath(grad, nx, bandTop, yUpTop, yUpBot, maxAbs, true);
     lower = dynamicPath(grad, nx, bandTop, yLoTop, yLoBot, maxAbs, false);
     if (lengthOf(upper) == 0 || lengthOf(lower) == 0) return false;
@@ -256,17 +224,12 @@ function trace(xc, yc) {
         py[nodesPerBorder + i] = lo[nodesPerBorder + k];
     }
 
-    autoX = Array.copy(px);
-    autoY = Array.copy(py);
-    autoN = n;
     lastUpperCount = nodesPerBorder;
-
     makeSelection("polygon", px, py);
     return true;
 }
 
-/* Caminho de custo minimo entre yTop e yBot, coluna a coluna.
-   Retorna um array de nx ordenadas (y). */
+/* Caminho de custo minimo entre yTop e yBot, coluna a coluna. */
 function dynamicPath(grad, nx, bandTop, yTop, yBot, maxAbs, wantNegative) {
     ny = yBot - yTop + 1;
     if (nx < 2 || ny < 2) return newArray(0);
@@ -282,7 +245,6 @@ function dynamicPath(grad, nx, bandTop, yTop, yBot, maxAbs, wantNegative) {
         D[j] = sgn * grad[(dy0 + j) * nx] / maxAbs;
         B[j] = j;
     }
-
     for (i = 1; i < nx; i++) {
         cur  = i * ny;
         prev = (i - 1) * ny;
@@ -315,7 +277,7 @@ function dynamicPath(grad, nx, bandTop, yTop, yBot, maxAbs, wantNegative) {
     return path;
 }
 
-/* Reamostra o caminho em n nos. Retorna array de 2n: [x0..xn-1, y0..yn-1]. */
+/* Reamostra o caminho em n nos. Retorna 2n valores: [x..., y...]. */
 function resamplePath(x0, path, n) {
     nx  = lengthOf(path);
     out = newArray(2 * n);
@@ -332,47 +294,8 @@ function resamplePath(x0, path, n) {
 }
 
 
-// ================================================================ metricas
+// ================================================================== metricas
 
-function reportRoi() {
-    if (selectionType() != 2) {
-        showStatus("Detrusor: o ROI atual nao e um poligono.");
-        return;
-    }
-    Roi.getCoordinates(fx, fy);
-    n = lengthOf(fx);
-
-    fer  = feretMinMax(fx, fy, n);
-    fmin = fer[0];
-    fmax = fer[1];
-    raf  = NaN;
-    if (fmin > 0) raf = fmax / fmin;
-
-    dperp = NaN;
-    if (lastUpperCount > 0 && n == lastUpperCount * 2)
-        dperp = meanPerpendicular(fx, fy, n, lastUpperCount);
-
-    u = "mm";
-    if (uncalibrated) u = "px";
-
-    s = "Fmin " + d2s(fmin, 3) + " " + u;
-    if (uncalibrated) s = s + "  (SEM CALIBRACAO)";
-    if (!isNaN(dperp)) s = s + "  |  Dperp " + d2s(dperp, 3) + " " + u;
-    s = s + "  |  RAF " + d2s(raf, 1);
-    if (raf < rafThreshold) s = s + "  << REVISAR";
-    if (pendingOpen) s = s + "   [g] = gravar";
-
-    showStatus(s);
-
-    Overlay.remove;
-    setFont("SansSerif", 13);
-    if (raf < rafThreshold) setColor("orange"); else setColor("yellow");
-    Roi.getBounds(bx, by, bw, bh);
-    Overlay.drawString(s, bx, maxOf(14, by - 8));
-    Overlay.show;
-}
-
-/* Diametros minimo e maximo de Feret, calibrados. Retorna [fmin, fmax]. */
 function feretMinMax(fx, fy, n) {
     cx = newArray(n);
     cy = newArray(n);
@@ -415,7 +338,9 @@ function feretMinMax(fx, fy, n) {
     return newArray(fmin, fmax);
 }
 
-/* Envoltorio convexo (monotone chain). Retorna array de 2m: [x..., y...]. */
+/* Envoltorio convexo (monotone chain). Retorna 2m valores: [x..., y...].
+   Atencao: a linguagem de macro NAO faz curto-circuito em &&, por isso os
+   testes de indice ficam fora das condicoes compostas. */
 function convexHull(px, py, n) {
     if (n < 3) {
         r = newArray(2 * n);
@@ -424,12 +349,10 @@ function convexHull(px, py, n) {
     }
     sx = Array.copy(px);
     sy = Array.copy(py);
-    for (i = 1; i < n; i++) {          // ordena por x, depois por y
+    for (i = 1; i < n; i++) {
         kx = sx[i];
         ky = sy[i];
         j = i - 1;
-        // A linguagem de macro nao faz curto-circuito em &&: o teste do
-        // indice precisa ficar fora da condicao composta.
         while (j >= 0) {
             maior = false;
             if (sx[j] > kx) maior = true;
@@ -476,7 +399,6 @@ function cross(ox, oy, ax, ay, bx, by) {
     return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
 }
 
-/* Distancia perpendicular media entre a borda superior e a inferior. */
 function meanPerpendicular(fx, fy, n, nUpper) {
     nlo = n - nUpper;
     if (nlo < 2) return NaN;
@@ -520,9 +442,8 @@ function pointToSegment(pxx, pyy, ax, ay, bx, by) {
 }
 
 
-// ============================================================== calibracao
+// ================================================================ calibracao
 
-/* Retorna [mm/px em x, mm/px em y] ou um array vazio se nao houver calibracao. */
 function pixelSizeMm() {
     dx = dicomNumber("0018,602C");
     dy = dicomNumber("0018,602E");
@@ -561,248 +482,4 @@ function dicomNumber(tag) {
     s = dicomString(tag);
     if (lengthOf(s) == 0) return NaN;
     return parseFloat(s);
-}
-
-
-// ================================================================ registro
-
-/* Pasta onde ficam o CSV e os .roi. */
-function logDir() {
-    d = call("ij.Prefs.get", "detrusor.logdir", "");
-    if (lengthOf(d) == 0) {
-        d = getDirectory("home") + "detrusor_log" + File.separator;
-        call("ij.Prefs.set", "detrusor.logdir", d);
-    }
-    return d;
-}
-
-function chooseLogDir() {
-    d = getDirectory("Pasta de registro do Detrusor Tracer");
-    if (lengthOf(d) > 0) call("ij.Prefs.set", "detrusor.logdir", d);
-}
-
-/* Grava CSV + os dois .roi da medida pendente. */
-function commitMeasurement() {
-    if (!pendingOpen || autoN == 0) {
-        showStatus("Detrusor: nenhuma medida pendente para gravar.");
-        return;
-    }
-    if (selectionType() != 2) {
-        showStatus("Detrusor: o ROI atual nao e um poligono.");
-        return;
-    }
-    Roi.getCoordinates(fx, fy);
-    fn = lengthOf(fx);
-
-    if (askEachTime) askLabels();
-
-    // Metricas do poligono automatico.
-    fA        = feretMinMax(autoX, autoY, autoN);
-    fminAuto  = fA[0];
-    rafAuto   = NaN;
-    if (fA[0] > 0) rafAuto = fA[1] / fA[0];
-    dperpAuto = NaN;
-    if (lastUpperCount > 0 && autoN == lastUpperCount * 2)
-        dperpAuto = meanPerpendicular(autoX, autoY, autoN, lastUpperCount);
-
-    // Metricas do poligono corrigido.
-    fF         = feretMinMax(fx, fy, fn);
-    fminFinal  = fF[0];
-    rafFinal   = NaN;
-    if (fF[0] > 0) rafFinal = fF[1] / fF[0];
-    dperpFinal = NaN;
-    if (lastUpperCount > 0 && fn == lastUpperCount * 2)
-        dperpFinal = meanPerpendicular(fx, fy, fn, lastUpperCount);
-
-    // Deslocamento no a no (so se a contagem de vertices nao mudou).
-    movidos   = -1;
-    descMedio = NaN;
-    descMax   = NaN;
-    if (fn == autoN) {
-        movidos = 0;
-        soma = 0;
-        mx   = 0;
-        for (i = 0; i < fn; i++) {
-            dxPx = fx[i] - autoX[i];
-            dyPx = fy[i] - autoY[i];
-            dPx  = sqrt(dxPx * dxPx + dyPx * dyPx);
-            if (dPx > movedNodeTolPx) movidos++;
-            dxMm = dxPx * calX;
-            dyMm = dyPx * calY;
-            dMm  = sqrt(dxMm * dxMm + dyMm * dyMm);
-            soma = soma + dMm;
-            if (dMm > mx) mx = dMm;
-        }
-        descMedio = soma / fn;
-        descMax   = mx;
-    }
-    ajustou = "sim";
-    if (movidos < 0) ajustou = "nos_alterados";
-    else if (movidos == 0) ajustou = "nao";
-
-    // Nomes dos arquivos.
-    getDateAndTime(yr, mo, dw, dd, hh, mi, ss, ms);
-    stamp = "" + yr + IJ.pad(mo + 1, 2) + IJ.pad(dd, 2) + "_"
-              + IJ.pad(hh, 2) + IJ.pad(mi, 2) + IJ.pad(ss, 2);
-    base = "p" + IJ.pad(caso, 2) + "_" + sanitize(pendingImageName) + "_"
-         + INCIDENCIAS[incidenciaIdx] + "_" + MOMENTOS[momentoIdx] + "_"
-         + ESTRUTURAS[estruturaIdx] + "_" + stamp;
-
-    dir = logDir();
-    File.makeDirectory(dir);
-    roiAuto  = base + "_auto";
-    roiFinal = base + "_final";
-
-    saveAs("Selection", dir + roiFinal + ".roi");
-    makeSelection("polygon", autoX, autoY);
-    saveAs("Selection", dir + roiAuto + ".roi");
-    makeSelection("polygon", fx, fy);
-
-    pxmmX = "NA";
-    pxmmY = "NA";
-    if (!uncalibrated) {
-        pxmmX = num(calX, 5);
-        pxmmY = num(calY, 5);
-    }
-    fminRel = "";
-    if (fminRelatorio > 0) fminRel = num(fminRelatorio, 4);
-
-    row = "" + caso + ","
-        + csvSafe(pendingImageName) + ","
-        + INCIDENCIAS[incidenciaIdx] + ","
-        + MOMENTOS[momentoIdx] + ","
-        + ESTRUTURAS[estruturaIdx] + ","
-        + num(fminAuto, 4) + ","
-        + num(fminFinal, 4) + ","
-        + ajustou + ","
-        + movidos + ","
-        + QUALIDADES[qualidadeIdx] + ","
-        + roiAuto + ","
-        + roiFinal + ","
-        + num(dperpAuto, 4) + ","
-        + num(dperpFinal, 4) + ","
-        + num(rafAuto, 2) + ","
-        + num(rafFinal, 2) + ","
-        + num(descMedio, 4) + ","
-        + num(descMax, 4) + ","
-        + num(lambda, 2) + ","
-        + num(blurSigma, 2) + ","
-        + num(halfWidthMm, 2) + ","
-        + num(maxHalfThicknessMm, 2) + ","
-        + clickX + ","
-        + clickY + ","
-        + num(freqMHz, 1) + ","
-        + num(profundidadeCm, 3) + ","
-        + pxmmX + ","
-        + pxmmY + ","
-        + num(volMic1, 0) + ","
-        + num(volMic2, 0) + ","
-        + fminRel + ","
-        + stamp + ","
-        + csvSafe(obs);
-
-    appendCsv(dir + "calibracao_detrusor.csv", row);
-
-    pendingOpen = false;
-    showStatus("Gravado: caso " + caso + ", " + ESTRUTURAS[estruturaIdx]
-             + ", Fmin auto " + d2s(fminAuto, 3)
-             + " -> final " + d2s(fminFinal, 3) + " mm (" + ajustou + ")");
-}
-
-function appendCsv(path, row) {
-    if (!File.exists(path)) File.append(CSV_HEADER, path);
-    File.append(row, path);
-}
-
-
-// ================================================================ dialogos
-
-/* Dialogo de rotulos clinicos. Os valores persistem entre medidas.
-   Cancelar aborta a macro (limitacao da linguagem de macro). */
-function askLabels() {
-    Dialog.create("Gravar medida");
-    Dialog.addNumber("Caso:", caso);
-    Dialog.addChoice("Incidencia:", INCIDENCIAS, INCIDENCIAS[incidenciaIdx]);
-    Dialog.addChoice("Momento:", MOMENTOS, MOMENTOS[momentoIdx]);
-    Dialog.addChoice("Estrutura:", ESTRUTURAS, ESTRUTURAS[estruturaIdx]);
-    Dialog.addChoice("Qualidade:", QUALIDADES, QUALIDADES[qualidadeIdx]);
-    Dialog.addNumber("Frequencia (MHz):", freqMHz, 1, 6, "MHz");
-    Dialog.addNumber("Profundidade (cm):", profundidadeCm, 2, 6, "cm");
-    Dialog.addNumber("Miccao 1 (mL):", volMic1, 0, 6, "mL");
-    Dialog.addNumber("Miccao 2 (mL):", volMic2, 0, 6, "mL");
-    Dialog.addNumber("Fmin do relatorio (0 = sem):", fminRelatorio, 4, 8, "mm");
-    Dialog.addString("Observacao:", obs, 30);
-    Dialog.show();
-
-    caso          = Dialog.getNumber();
-    incidenciaIdx = indexOfArray(INCIDENCIAS, Dialog.getChoice());
-    momentoIdx    = indexOfArray(MOMENTOS,    Dialog.getChoice());
-    estruturaIdx  = indexOfArray(ESTRUTURAS,  Dialog.getChoice());
-    qualidadeIdx  = indexOfArray(QUALIDADES,  Dialog.getChoice());
-    freqMHz        = Dialog.getNumber();
-    profundidadeCm = Dialog.getNumber();
-    volMic1        = Dialog.getNumber();
-    volMic2        = Dialog.getNumber();
-    fminRelatorio  = Dialog.getNumber();
-    obs            = Dialog.getString();
-}
-
-function showOptionsDialog() {
-    Dialog.create("Detrusor Tracer");
-    Dialog.addNumber("Meia-largura da janela (mm):", halfWidthMm, 2, 6, "mm");
-    Dialog.addNumber("Espessura maxima buscada (mm):", maxHalfThicknessMm, 2, 6, "mm");
-    Dialog.addNumber("Suavidade (lambda):", lambda, 2, 6, "");
-    Dialog.addNumber("Blur anti-speckle (px):", blurSigma, 2, 6, "px");
-    Dialog.addNumber("Nos por borda:", nodesPerBorder, 0, 6, "");
-    Dialog.addNumber("Limiar de RAF para revisao:", rafThreshold, 1, 6, "");
-    Dialog.addCheckbox("Perguntar rotulos a cada medida", askEachTime);
-    Dialog.addCheckbox("Passar para a ferramenta poligono apos tracar", switchToPolygon);
-    Dialog.addMessage("Pasta de registro: " + logDir());
-    Dialog.addCheckbox("Escolher outra pasta de registro", false);
-    Dialog.show();
-
-    halfWidthMm        = Dialog.getNumber();
-    maxHalfThicknessMm = Dialog.getNumber();
-    lambda             = Dialog.getNumber();
-    blurSigma          = Dialog.getNumber();
-    nodesPerBorder     = Dialog.getNumber();
-    rafThreshold       = Dialog.getNumber();
-    askEachTime        = Dialog.getCheckbox();
-    switchToPolygon    = Dialog.getCheckbox();
-    if (Dialog.getCheckbox()) chooseLogDir();
-}
-
-
-// ================================================================ utilidades
-
-/* Nome do arquivo de imagem, sem identificadores do paciente. */
-function imageBaseName() {
-    n = getTitle();
-    if (lengthOf(n) == 0) n = "sem_nome";
-    dot = lastIndexOf(n, ".");
-    if (dot > 0) n = substring(n, 0, dot);
-    return n;
-}
-
-function sanitize(s) {
-    if (lengthOf(s) == 0) return "x";
-    return replace(s, "[^A-Za-z0-9_-]", "_");
-}
-
-function csvSafe(s) {
-    if (lengthOf(s) == 0) return "";
-    s = replace(s, ",", ";");
-    s = replace(s, "[\n\r]", " ");
-    return s;
-}
-
-function num(v, dec) {
-    if (isNaN(v)) return "NA";
-    return d2s(v, dec);
-}
-
-function indexOfArray(arr, value) {
-    for (i = 0; i < lengthOf(arr); i++)
-        if (arr[i] == value) return i;
-    return 0;
 }
