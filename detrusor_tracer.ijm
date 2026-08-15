@@ -431,7 +431,13 @@ function convexHull(px, py, n) {
         kx = sx[i];
         ky = sy[i];
         j = i - 1;
-        while (j >= 0 && (sx[j] > kx || (sx[j] == kx && sy[j] > ky))) {
+        // A linguagem de macro nao faz curto-circuito em &&: o teste do
+        // indice precisa ficar fora da condicao composta.
+        while (j >= 0) {
+            maior = false;
+            if (sx[j] > kx) maior = true;
+            else if (sx[j] == kx && sy[j] > ky) maior = true;
+            if (!maior) break;
             sx[j + 1] = sx[j];
             sy[j + 1] = sy[j];
             j--;
@@ -444,14 +450,20 @@ function convexHull(px, py, n) {
     hy = newArray(2 * n);
     k = 0;
     for (i = 0; i < n; i++) {
-        while (k >= 2 && cross(hx[k-2], hy[k-2], hx[k-1], hy[k-1], sx[i], sy[i]) <= 0) k--;
+        while (k >= 2) {
+            if (cross(hx[k-2], hy[k-2], hx[k-1], hy[k-1], sx[i], sy[i]) > 0) break;
+            k--;
+        }
         hx[k] = sx[i];
         hy[k] = sy[i];
         k++;
     }
     lower = k + 1;
     for (i = n - 2; i >= 0; i--) {
-        while (k >= lower && cross(hx[k-2], hy[k-2], hx[k-1], hy[k-1], sx[i], sy[i]) <= 0) k--;
+        while (k >= lower) {
+            if (cross(hx[k-2], hy[k-2], hx[k-1], hy[k-1], sx[i], sy[i]) > 0) break;
+            k--;
+        }
         hx[k] = sx[i];
         hy[k] = sy[i];
         k++;
@@ -536,15 +548,16 @@ function pixelSizeMm() {
     f = 0;
     if (startsWith(u, "mm")) f = 1.0;
     else if (startsWith(u, "cm")) f = 10.0;
-    else if (startsWith(u, "um") || startsWith(u, "micron") || startsWith(u, "\u00b5")) f = 0.001;
+    else if (startsWith(u, "um") || startsWith(u, "micron")
+             || startsWith(u, fromCharCode(181))) f = 0.001;
     else return newArray(0);
     return newArray(pw * f, ph * f);
 }
 
 function dicomString(tag) {
     v = getInfo(tag);
-    if (v == "0" || lengthOf(v) == 0) return "";
-    return String.trim(v);
+    if (lengthOf(v) == 0) return "";
+    return replace(v, "^[ \t]+|[ \t]+$", "");
 }
 
 function dicomNumber(tag) {
