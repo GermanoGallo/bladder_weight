@@ -9,17 +9,16 @@
 //      https://ij.imjoy.io/?run=<url_do_gist>
 //    A macro entra em espera assim que o app carrega. Abra a imagem
 //    normalmente (File > Open ou arrastando para a janela); a macro
-//    detecta a imagem sozinha e passa a responder aos cliques.
+//    detecta a imagem sozinha e ativa a ferramenta de PONTO.
 //
 //  COMO USAR (rodando na mao)
 //    Plugins > New > Macro, colar, Ctrl+R. Funciona igual.
 //
-//  CLIQUES (sobre a imagem)
-//    clique simples        -> traca as bordas naquele ponto
-//    clique sobre um no    -> nao traca; arraste o no e as metricas sao
-//                             recalculadas quando voce solta
-//    Shift + clique        -> recalcula as metricas do ROI atual
-//    Alt + clique          -> encerra a macro
+//  ACIONAMENTO (nao depende de eventos de mouse: a macro vigia a SELECAO)
+//    marcar um PONTO dentro da faixa hipoecoica -> traca as bordas ali
+//    arrastar um no do poligono                 -> metricas recalculadas
+//                                                  automaticamente
+//    tracar uma LINHA (ferramenta linha)        -> encerra a macro
 //
 //  Saida: poligono na imagem + metricas na barra de status e na janela Log.
 // =====================================================================
@@ -49,49 +48,68 @@ var lastUpperCount = -1;
 //  comeca antes de o usuario abrir qualquer arquivo.
 
 var LIMITE_MIN = 120;     // encerra sozinha apos este tempo de sessao (min)
+var ultimoX = newArray(0);   // ultimo poligono conhecido, para detectar edicao
+var ultimoY = newArray(0);
 
 print("\\Clear");
 print("Detrusor (teste) ativo.");
-print("  Abra uma imagem e clique dentro da faixa hipoecoica.");
-print("  Shift+clique recalcula, Alt+clique encerra.");
+print("  1. Abra a imagem.");
+print("  2. Marque um PONTO dentro da faixa hipoecoica (ferramenta ponto).");
+print("  3. Arraste os nos do poligono: as metricas se atualizam sozinhas.");
+print("  Para encerrar: trace uma LINHA com a ferramenta linha.");
 showStatus("Detrusor: aguardando uma imagem...");
 
 fimSessao = getTime() + LIMITE_MIN * 60000;
-avisouImagem = false;
+semImagem = true;
 rodando = true;
+editando = false;
+tEdicao = 0;
 
 while (rodando && getTime() < fimSessao) {
     if (nImages == 0) {
-        if (!avisouImagem) {
+        if (!semImagem) {
             showStatus("Detrusor: aguardando uma imagem...");
-            avisouImagem = true;
+            semImagem = true;
         }
         wait(400);
     } else {
-        if (avisouImagem) {
-            showStatus("Detrusor: clique dentro da faixa hipoecoica.");
-            setTool("polygon");        // permite arrastar os nos depois
-            avisouImagem = false;
+        if (semImagem) {
+            setTool("point");
+            showStatus("Detrusor: marque um ponto na faixa hipoecoica.");
+            semImagem = false;
         }
-        getCursorLoc(cx, cy, cz, flags);
-        if ((flags & 16) != 0) {                   // botao esquerdo
-            alt   = ((flags & 8) != 0) || ((flags & 4) != 0);
-            shift = ((flags & 1) != 0);
-            soltaBotao();
-            if (alt) {
-                rodando = false;
-            } else if (shift) {
-                if (selectionType() == 2) relatorio(-1, -1, -1);
-                else showStatus("Detrusor: nao ha poligono para recalcular.");
-            } else if (sobreNo(cx, cy)) {
-                // clique em cima de um no: deixa o usuario arrastar e so
-                // recalcula ao final do arraste
-                if (selectionType() == 2) relatorio(-1, -1, -1);
-            } else {
-                mede(cx, cy);
+
+        st = selectionType();
+
+        if (st == 10) {                      // ponto: novo tracado
+            Roi.getCoordinates(sx, sy);
+            if (lengthOf(sx) > 0) {
+                px0 = round(sx[0]);
+                py0 = round(sy[0]);
+                run("Select None");
+                mede(px0, py0);
+                editando = false;
             }
+            wait(120);
+
+        } else if (st == 5 || st == 6 || st == 7) {   // linha: encerra
+            rodando = false;
+
+        } else if (st == 2) {                // poligono: vigia edicao dos nos
+            if (poligonoMudou()) {
+                relatorio(-1, -1, -1, false);   // atualiza status/overlay
+                guardaPoligono();
+                editando = true;
+                tEdicao = getTime();
+            } else if (editando && getTime() - tEdicao > 700) {
+                relatorio(-1, -1, -1, true);    // estabilizou: registra no Log
+                editando = false;
+            }
+            wait(120);
+
+        } else {
+            wait(200);
         }
-        wait(30);
     }
 }
 
@@ -102,30 +120,21 @@ showStatus("Detrusor: encerrado.");
 
 // ============================================================ laco auxiliar
 
-/* Espera o botao ser solto, com teto de 5 s (em alguns ambientes o evento
-   de soltar ainda traz o bit do botao ligado). */
-function soltaBotao() {
-    limite = getTime() + 5000;
-    while (getTime() < limite) {
-        getCursorLoc(ax, ay, az, f2);
-        if ((f2 & 16) == 0) break;
-        wait(20);
-    }
-    wait(120);
+/* Guarda o poligono corrente como referencia. */
+function guardaPoligono() {
+    Roi.getCoordinates(vx, vy);
+    ultimoX = Array.copy(vx);
+    ultimoY = Array.copy(vy);
 }
 
-/* True se o clique caiu sobre um vertice do poligono corrente. */
-function sobreNo(xc, yc) {
-    if (selectionType() != 2) return false;
+/* True se o poligono corrente difere do que foi guardado. */
+function poligonoMudou() {
     Roi.getCoordinates(vx, vy);
-    tol = 6;
-    z = getZoom();
-    if (z > 0) tol = 6 / z;
-    if (tol < 3) tol = 3;
-    for (i = 0; i < lengthOf(vx); i++) {
-        dx = vx[i] - xc;
-        dy = vy[i] - yc;
-        if (sqrt(dx * dx + dy * dy) <= tol) return true;
+    n = lengthOf(vx);
+    if (n != lengthOf(ultimoX)) return true;
+    for (i = 0; i < n; i++) {
+        if (abs(vx[i] - ultimoX[i]) > 0.01) return true;
+        if (abs(vy[i] - ultimoY[i]) > 0.01) return true;
     }
     return false;
 }
@@ -142,16 +151,19 @@ function mede(xc, yc) {
     if (!trace(xc, yc)) {
         showStatus("Detrusor: nao foi possivel tracar as bordas aqui.");
         print("Detrusor: falha no tracado em (" + xc + ", " + yc + ").");
-        print("  Janela pequena demais ou clique perto demais da borda da imagem.");
+        print("  Janela pequena demais ou ponto perto demais da borda da imagem.");
+        ultimoX = newArray(0);
+        ultimoY = newArray(0);
     } else {
-        relatorio(xc, yc, getTime() - t0);
+        relatorio(xc, yc, getTime() - t0, true);
+        guardaPoligono();
     }
 }
 
 
 // ================================================================= relatorio
 
-function relatorio(xc, yc, dt) {
+function relatorio(xc, yc, dt, imprime) {
     Roi.getCoordinates(fx, fy);
     n = lengthOf(fx);
 
@@ -182,19 +194,21 @@ function relatorio(xc, yc, dt) {
     Overlay.drawString(s, bx, maxOf(14, by - 8));
     Overlay.show;
 
-    print("--- Detrusor (teste) -------------------------------");
-    if (xc >= 0) print("  clique          : (" + xc + ", " + yc + ")");
-    else         print("  (recalculo do ROI corrente)");
-    if (uncalibrated)
-        print("  calibracao      : NENHUMA (medidas em pixels)");
-    else
-        print("  calibracao      : " + d2s(calX, 5) + " x " + d2s(calY, 5) + " mm/px");
-    print("  Fmin            : " + d2s(fmin, 4) + " " + u);
-    print("  Fmax            : " + d2s(fmax, 4) + " " + u);
-    print("  RAF (Fmax/Fmin) : " + d2s(raf, 2));
-    if (!isNaN(dperp)) print("  Dperp           : " + d2s(dperp, 4) + " " + u);
-    print("  vertices        : " + n + " (" + lastUpperCount + " por borda)");
-    if (dt >= 0) print("  tempo           : " + dt + " ms");
+    if (imprime) {
+        print("--- Detrusor (teste) -------------------------------");
+        if (xc >= 0) print("  ponto           : (" + xc + ", " + yc + ")");
+        else         print("  (apos ajuste manual dos nos)");
+        if (uncalibrated)
+            print("  calibracao      : NENHUMA (medidas em pixels)");
+        else
+            print("  calibracao      : " + d2s(calX, 5) + " x " + d2s(calY, 5) + " mm/px");
+        print("  Fmin            : " + d2s(fmin, 4) + " " + u);
+        print("  Fmax            : " + d2s(fmax, 4) + " " + u);
+        print("  RAF (Fmax/Fmin) : " + d2s(raf, 2));
+        if (!isNaN(dperp)) print("  Dperp           : " + d2s(dperp, 4) + " " + u);
+        print("  vertices        : " + n + " (" + lastUpperCount + " por borda)");
+        if (dt >= 0) print("  tempo           : " + dt + " ms");
+    }
 }
 
 
