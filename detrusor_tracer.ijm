@@ -21,26 +21,62 @@
 //    tracar uma LINHA (ferramenta linha)        -> encerra a macro
 //
 //  Saida: poligono na imagem + metricas na barra de status e na janela Log.
+//
+//  CRITERIOS DE ANALISE (recalibrados em 15/08/2026 com 10 medidas
+//  corrigidas manualmente e 9 pares de ROI auto/final)
+//    - Dperp e a medida primaria de espessura. Fmin superestima em 1.50x
+//      +- 0.10 e passou a ser indicador de forma, nao de espessura.
+//    - Janela de busca reduzida de 1.20 para 0.70 mm: a distancia do
+//      clique ate a borda corrigida nunca passou de 0.503 mm.
+//    - Alerta de saturacao (borda encostada no limite da janela): detectou
+//      o unico erro grosseiro da serie sem nenhum falso positivo.
+//    - RAF passou de 3.0 para 6.0: com 3.0 o alerta nunca disparava.
+//    - Espessura fora de 0.25 a 0.95 mm sinaliza revisao.
+//    - lambda e blur mantidos: as bordas automaticas ja saem mais suaves
+//      que as corrigidas a mao.
 // =====================================================================
 
 // ------------------------------------------------------------- parametros
-// Ajuste aqui e rode de novo para comparar resultados.
+//  Valores recalibrados a partir de 10 medidas corrigidas manualmente
+//  (IM_0002/0003/0006/0007, sagital, pre-miccional, 30 MHz, ~0.025 mm/px).
+//  Ver o bloco CRITERIOS DE ANALISE no fim deste cabeçalho de secao.
 
 var halfWidthMm         = 4.0;    // meia-largura da janela, imagem calibrada
-var maxHalfThicknessMm  = 1.2;    // espessura maxima buscada, calibrada
-var halfWidthPx         = 170;    // meia-largura, imagem SEM calibracao
-var maxHalfThicknessPx  = 50;     // espessura maxima, imagem SEM calibracao
+// 1.20 antes. Nas 10 medidas corrigidas a distancia do clique ate a borda
+// nunca passou de 0.503 mm (p90 = 0.497). Com 1.20 a janela permitia uma
+// "espessura" de ate 2.4 mm, tres vezes o maximo real, e foi exatamente o
+// que produziu o unico erro grosseiro da serie (caso 6: 1.545 mm no
+// automatico contra 0.514 mm apos correcao). 0.70 mantem ~40% de folga.
+var maxHalfThicknessMm  = 0.70;   // espessura maxima buscada, calibrada
+var halfWidthPx         = 160;    // meia-largura, imagem SEM calibracao
+var maxHalfThicknessPx  = 28;     // espessura maxima, imagem SEM calibracao
 var minHalfThicknessPx  = 2;
+// Mantidos: as bordas automaticas ja saem MAIS suaves que as corrigidas a
+// mao (rugosidade media 0.044 mm contra 0.083 mm). Aumentar lambda so
+// brigaria com o operador; o problema nunca foi falta de suavidade.
 var lambda              = 0.60;   // suavidade do caminho
-var blurSigma           = 1.0;    // blur anti-speckle, em pixels
+var blurSigma           = 1.00;   // blur anti-speckle, em pixels
 var nodesPerBorder      = 12;     // nos por borda
-var rafThreshold        = 3.0;    // limiar de RAF para sinalizar revisao
+// 3.0 antes, e nunca disparou: o menor RAF automatico da serie foi 4.20,
+// justamente o caso que falhou. O segundo menor foi 7.13, numa medida boa.
+var rafThreshold        = 6.0;    // limiar de RAF para sinalizar revisao
+// Faixa plausivel da espessura do detrusor nesta serie (Dperp corrigido
+// variou de 0.313 a 0.797 mm). Fora disso, revisar.
+var espMinMm            = 0.25;
+var espMaxMm            = 0.95;
+// Fracao das colunas que pode encostar no limite da janela antes de o
+// tracado ser considerado saturado (indicador causal de fuga da borda).
+var satTolerancia       = 0.05;
 
 // ------------------------------------------------------------ estado interno
 var calX = 1.0;
 var calY = 1.0;
 var uncalibrated = false;
 var lastUpperCount = -1;
+// Fracao das colunas em que cada borda automatica encostou no limite da
+// janela de busca. Preenchido por trace(), lido por relatorio().
+var satSup = 0;
+var satInf = 0;
 
 
 // ================================================================== inicio
@@ -180,16 +216,31 @@ function relatorio(xc, yc, dt, imprime) {
     u = "mm";
     if (uncalibrated) u = "px";
 
-    s = "Fmin " + d2s(fmin, 3) + " " + u;
+    // ------------------------------------------------------ criterios de QC
+    //  Dperp e a medida primaria. Fmin (menor Feret do envoltorio convexo)
+    //  superestima a espessura de forma sistematica nesta geometria: nas 10
+    //  medidas corrigidas a razao Fmin/Dperp ficou em 1.50 +- 0.10
+    //  (faixa 1.30 a 1.66), porque a faixa e alongada e levemente curva.
+    //  Fmin fica como indicador secundario de forma, nao de espessura.
+    alerta = "";
+    if (satSup > satTolerancia || satInf > satTolerancia)
+        alerta = alerta + "  << BORDA NO LIMITE DA JANELA";
+    if (raf < rafThreshold)
+        alerta = alerta + "  << RAF BAIXO";
+    if (!uncalibrated && !isNaN(dperp) && (dperp < espMinMm || dperp > espMaxMm))
+        alerta = alerta + "  << ESPESSURA ATIPICA";
+
+    s = "Esp " + d2s(dperp, 3) + " " + u;
+    if (isNaN(dperp)) s = "Esp indisponivel";
     if (uncalibrated) s = s + "  (SEM CALIBRACAO)";
-    if (!isNaN(dperp)) s = s + "  |  Dperp " + d2s(dperp, 3) + " " + u;
+    s = s + "  |  Fmin " + d2s(fmin, 3);
     s = s + "  |  RAF " + d2s(raf, 1);
-    if (raf < rafThreshold) s = s + "  << REVISAR";
+    s = s + alerta;
     showStatus(s);
 
     Overlay.remove;
     setFont("SansSerif", 13);
-    if (raf < rafThreshold) setColor("orange"); else setColor("yellow");
+    if (lengthOf(alerta) > 0) setColor("orange"); else setColor("yellow");
     Roi.getBounds(bx, by, bw, bh);
     Overlay.drawString(s, bx, maxOf(14, by - 8));
     Overlay.show;
@@ -202,10 +253,15 @@ function relatorio(xc, yc, dt, imprime) {
             print("  calibracao      : NENHUMA (medidas em pixels)");
         else
             print("  calibracao      : " + d2s(calX, 5) + " x " + d2s(calY, 5) + " mm/px");
-        print("  Fmin            : " + d2s(fmin, 4) + " " + u);
+        print("  Dperp (primaria): " + d2s(dperp, 4) + " " + u);
+        print("  Fmin (secundar.): " + d2s(fmin, 4) + " " + u
+              + "   [esperado ~1.5x Dperp]");
         print("  Fmax            : " + d2s(fmax, 4) + " " + u);
         print("  RAF (Fmax/Fmin) : " + d2s(raf, 2));
-        if (!isNaN(dperp)) print("  Dperp           : " + d2s(dperp, 4) + " " + u);
+        print("  saturacao       : sup " + d2s(satSup * 100, 0)
+              + "%  inf " + d2s(satInf * 100, 0) + "% das colunas");
+        if (lengthOf(alerta) > 0) print("  QC              : REVISAR ->" + alerta);
+        else                      print("  QC              : ok");
         print("  vertices        : " + n + " (" + lastUpperCount + " por borda)");
         if (dt >= 0) print("  tempo           : " + dt + " ms");
     }
@@ -273,6 +329,18 @@ function trace(xc, yc) {
     upper = dynamicPath(grad, nx, bandTop, yUpTop, yUpBot, maxAbs, true);
     lower = dynamicPath(grad, nx, bandTop, yLoTop, yLoBot, maxAbs, false);
     if (lengthOf(upper) == 0 || lengthOf(lower) == 0) return false;
+
+    // Saturacao: quantas colunas encostaram no limite da janela de busca.
+    // Uma borda colada no limite quase sempre significa que a programacao
+    // dinamica fugiu do detrusor e foi atras de um gradiente mais forte.
+    nSup = 0;
+    nInf = 0;
+    for (i = 0; i < nx; i++) {
+        if (upper[i] <= yUpTop) nSup++;
+        if (lower[i] >= yLoBot) nInf++;
+    }
+    satSup = nSup / nx;
+    satInf = nInf / nx;
 
     for (i = 0; i < nx; i++)
         if (lower[i] <= upper[i]) lower[i] = upper[i] + 1;
